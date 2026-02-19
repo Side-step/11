@@ -13,7 +13,7 @@ PROXY_WALLET_ADDRESS = os.getenv("PROXY_WALLET_ADDRESS", "")
 BUILDER_KEY = os.getenv("BUILDER_KEY", "")
 BUILDER_SECRET = os.getenv("BUILDER_SECRET", "")
 BUILDER_PASSPHRASE = os.getenv("BUILDER_PASSPHRASE", "")
-POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "")
+POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
 POLY_API_KEY = os.getenv("POLY_API_KEY", "")
 POLY_API_SECRET = os.getenv("POLY_API_SECRET", "")
 POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
@@ -24,7 +24,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── Operation Mode ────────────────────────────────────────────
 # observe | small_live | five_min_entry | full
-OPERATION_MODE = os.getenv("OPERATION_MODE", "observe")
+OPERATION_MODE = os.getenv("OPERATION_MODE", "full")
 
 # ── Chain & Contracts (Polygon Mainnet) ───────────────────────
 CHAIN_ID = 137
