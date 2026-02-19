@@ -42,7 +42,7 @@ class ScalpingOrchestrator:
         self.risk = RiskManager(self.bot, self.feed, self.poly)
         self.learning = AdaptiveLearningEngine()
         self.redeemer = AutoRedeemer()
-        self.telegram = TelegramNotifier(self.bot)
+        self.telegram = TelegramNotifier()
 
         # Market cache
         self._markets: list[MarketInfo] = []
@@ -78,7 +78,7 @@ class ScalpingOrchestrator:
         initial = float(os.environ.get("INITIAL_CAPITAL", 0)) or balance or 200.0
         self.bot = BotState(initial_balance=initial)
         self.risk = RiskManager(self.bot, self.feed, self.poly)
-        self.telegram = TelegramNotifier(self.bot)
+        self.telegram = TelegramNotifier()
         logger.info("STEP 1: Balance = $%.2f", self.bot.balance)
 
         # STEP 3: 시장 스캔
@@ -95,9 +95,6 @@ class ScalpingOrchestrator:
 
         # STEP 6: Auto-Redeemer 초기화
         self.redeemer.initialize()
-
-        # STEP 7: 텔레그램 초기화
-        await self.telegram.initialize()
 
         self.bot.phase = BotPhase.RUNNING
         logger.info("BOOT COMPLETE - Trading loop starting")
@@ -144,7 +141,7 @@ class ScalpingOrchestrator:
         # 1. 쿨다운 체크
         if self.bot.phase == BotPhase.COOLDOWN:
             if self.risk.check_restart():
-                await self.telegram.notify_restart(True, self.bot.balance)
+                await self.telegram.notify_restart(True, self.bot.balance, self.bot.current_bet_pct)
             return
 
         if self.bot.phase != BotPhase.RUNNING:
@@ -153,11 +150,9 @@ class ScalpingOrchestrator:
         # 2. 비상 체크
         emergency = self.risk.check_emergency()
         if emergency:
-            loss = 0.0
-            if self.bot.has_position():
-                loss = self.bot.position.pnl_usd
             self.risk.handle_emergency(emergency)
-            await self.telegram.notify_emergency(emergency, self.bot.balance, loss)
+            cooldown_until = time.time() + 900  # 15분 쿨다운
+            await self.telegram.notify_emergency(emergency, self.bot.balance, cooldown_until)
             return
 
         # 3. 포지션 관리 (보유 중일 때)
@@ -250,19 +245,14 @@ class ScalpingOrchestrator:
         self.learning.record_trade(snapshot)
 
         # 텔레그램 알림
-        streak = self.bot.consecutive_wins or -self.bot.consecutive_losses
-        await self.telegram.notify_exit(
-            pos, reason, self.bot.balance,
-            self.bot.daily_wins, self.bot.daily_losses,
-            self.bot.daily_pnl, streak,
-        )
+        await self.telegram.notify_exit(self.bot, pos, reason)
 
         # 베팅 비율 변경 알림
         new_pct = self.bot.current_bet_pct
         if new_pct != old_pct:
             reason_str = f"{self.bot.consecutive_wins}연승" if self.bot.consecutive_wins > 0 else f"{self.bot.consecutive_losses}연패"
             next_bet = self.bot.balance * new_pct
-            await self.telegram.notify_bet_ratio_change(old_pct, new_pct, reason_str, next_bet)
+            await self.telegram.notify_bet_change(old_pct, new_pct, reason_str, next_bet)
 
     # ── 신호 평가 ─────────────────────────────────────────────
 
@@ -470,7 +460,7 @@ class ScalpingOrchestrator:
             bet_amount, strategy, confluence_score,
         )
 
-        await self.telegram.notify_entry(position, self.bot.balance, self.bot.current_bet_pct)
+        await self.telegram.notify_entry(self.bot, position)
 
     # ── 시장 스캔 ─────────────────────────────────────────────
 
@@ -508,19 +498,7 @@ class ScalpingOrchestrator:
                 break
 
             # 일일 리포트
-            stats = {
-                "total_trades": self.bot.daily_trades,
-                "wins": self.bot.daily_wins,
-                "losses": self.bot.daily_losses,
-                "net_pnl": self.bot.daily_pnl,
-                "start_balance": self.bot.daily_start_balance,
-                "end_balance": self.bot.balance,
-                "hwm": self.bot.hwm,
-                "total_return": ((self.bot.balance - self.bot.initial_balance) / self.bot.initial_balance * 100)
-                                if self.bot.initial_balance > 0 else 0,
-                "by_strategy": {},
-            }
-            await self.telegram.send_daily_report(stats)
+            await self.telegram.send_daily_report(self.bot)
 
             # 학습 데이터 백업
             self.learning.backup_daily()
