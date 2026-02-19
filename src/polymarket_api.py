@@ -94,9 +94,11 @@ class PolymarketClient:
                     api_passphrase=config.POLY_API_PASSPHRASE,
                 )
                 self._clob_client.set_api_creds(creds)
+                self._api_creds = creds
             else:
                 creds = self._clob_client.create_or_derive_api_creds()
                 self._clob_client.set_api_creds(creds)
+                self._api_creds = creds
                 logger.info("API creds derived: key=%s", creds.api_key)
 
             self._initialized = True
@@ -374,64 +376,151 @@ class PolymarketClient:
     # ── 잔고 / 포지션 ────────────────────────────────────────
 
     def get_balance(self) -> float:
-        """USDC 잔고를 조회합니다 (CLOB API → on-chain 순서로 시도)."""
-        # 방법 1: py-clob-client의 balance-allowance API
-        if self._initialized:
-            try:
-                result = self._clob_client.get_balance_allowance()
-                if result:
-                    if isinstance(result, dict):
-                        raw = result.get("balance", 0)
-                    else:
-                        raw = getattr(result, "balance", 0)
-                    bal = float(raw)
-                    # USDC 6 decimals: raw 단위가 매우 크면 변환
-                    usdc = bal / 1e6 if bal > 100_000 else bal
-                    if usdc > 0:
-                        logger.info("Balance (CLOB API): $%.2f", usdc)
-                        return usdc
-            except Exception as e:
-                logger.debug("CLOB balance-allowance failed: %s", e)
+        """USDC 잔고를 조회합니다 (CLOB API → REST → on-chain 순서로 시도)."""
 
-        # 방법 2: Polygon RPC로 프록시 지갑의 on-chain USDC 잔고 조회
-        bal = self._query_onchain_usdc()
+        # 방법 1: py-clob-client의 balance-allowance API (asset_type=COLLATERAL)
+        if self._initialized:
+            bal = self._balance_via_clob()
+            if bal > 0:
+                return bal
+
+        # 방법 2: CLOB REST API 직접 호출
+        bal = self._balance_via_rest()
+        if bal > 0:
+            return bal
+
+        # 방법 3: Polygon RPC로 on-chain USDC (지갑 + CTF Exchange)
+        bal = self._balance_onchain()
         if bal > 0:
             return bal
 
         logger.warning("All balance methods returned 0")
         return 0.0
 
-    def _query_onchain_usdc(self) -> float:
-        """Polygon RPC를 통해 프록시 지갑의 USDC 잔고를 조회합니다."""
-        proxy = config.PROXY_WALLET_ADDRESS
-        if not proxy:
-            return 0.0
-
-        # ERC20 balanceOf(address) selector = 0x70a08231
-        addr_hex = proxy.lower().replace("0x", "").zfill(64)
-        call_data = f"0x70a08231{addr_hex}"
-
-        for usdc_addr in [config.USDC_NATIVE, config.USDC_ADDRESS]:
-            try:
-                resp = requests.post(
-                    config.POLYGON_RPC_URL,
-                    json={
-                        "jsonrpc": "2.0",
-                        "method": "eth_call",
-                        "params": [{"to": usdc_addr, "data": call_data}, "latest"],
-                        "id": 1,
-                    },
-                    timeout=10,
-                )
-                result = resp.json().get("result", "0x0")
-                balance = int(result, 16) / 1e6  # USDC = 6 decimals
-                if balance > 0:
-                    logger.info("Balance (on-chain %s): $%.2f", usdc_addr[:10], balance)
-                    return balance
-            except Exception as e:
-                logger.debug("On-chain USDC query failed (%s): %s", usdc_addr[:10], e)
+    def _balance_via_clob(self) -> float:
+        """py-clob-client로 CLOB 잔고 조회 (공식 예제 기반)."""
+        # 공식 예제 방식: params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            result = self._clob_client.get_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            logger.info("CLOB balance-allowance raw response: %s", result)
+            bal = self._parse_balance_result(result, "CLOB")
+            if bal > 0:
+                return bal
+        except ImportError:
+            logger.info("BalanceAllowanceParams not available in this py-clob-client version")
+        except Exception as e:
+            logger.info("CLOB balance-allowance failed: %s", e)
 
         return 0.0
+
+    def _parse_balance_result(self, result, label: str) -> float:
+        """balance-allowance 응답에서 USDC 잔고 추출."""
+        if not result:
+            return 0.0
+        if isinstance(result, dict):
+            raw = result.get("balance", 0)
+        else:
+            raw = getattr(result, "balance", 0)
+        bal = float(raw)
+        # USDC 6 decimals: raw 단위가 매우 크면 wei→dollar 변환
+        usdc = bal / 1e6 if bal > 100_000 else bal
+        if usdc > 0:
+            logger.info("Balance (%s): $%.2f (raw=%s)", label, usdc, raw)
+        else:
+            logger.info("Balance (%s): $0 (raw=%s)", label, raw)
+        return usdc
+
+    def _balance_via_rest(self) -> float:
+        """CLOB REST API로 직접 잔고 조회."""
+        try:
+            # derive된 API 키로 인증 헤더 생성
+            headers = {}
+            if self._initialized and hasattr(self._clob_client, "creds") and self._clob_client.creds:
+                creds = self._clob_client.creds
+                headers = {
+                    "POLY_API_KEY": getattr(creds, "api_key", ""),
+                    "POLY_PASSPHRASE": getattr(creds, "api_passphrase", ""),
+                }
+            resp = requests.get(
+                f"{config.CLOB_HOST}/balance-allowance",
+                params={"asset_type": "COLLATERAL"},
+                headers=headers,
+                timeout=10,
+            )
+            logger.info("REST balance-allowance: status=%d body=%s",
+                        resp.status_code, resp.text[:200])
+            if resp.status_code == 200:
+                data = resp.json()
+                raw = data.get("balance", 0)
+                bal = float(raw)
+                usdc = bal / 1e6 if bal > 100_000 else bal
+                if usdc > 0:
+                    logger.info("Balance (REST): $%.2f", usdc)
+                    return usdc
+        except Exception as e:
+            logger.info("REST balance fetch failed: %s", e)
+        return 0.0
+
+    def _balance_onchain(self) -> float:
+        """Polygon RPC로 프록시 지갑의 USDC 잔고 조회 (지갑 + CTF Exchange)."""
+        proxy = config.PROXY_WALLET_ADDRESS
+        if not proxy:
+            logger.info("No PROXY_WALLET_ADDRESS set for on-chain query")
+            return 0.0
+
+        addr_hex = proxy.lower().replace("0x", "").zfill(64)
+
+        # 1) 지갑의 직접 USDC 잔고
+        for usdc_addr in [config.USDC_NATIVE, config.USDC_ADDRESS]:
+            bal = self._erc20_balance_of(usdc_addr, addr_hex, f"wallet-{usdc_addr[:10]}")
+            if bal > 0:
+                return bal
+
+        # 2) CTF Exchange에 예치된 USDC 잔고
+        #    balanceOf(address, tokenId) — ERC1155
+        #    USDC collateral의 tokenId = 0
+        try:
+            # ERC1155 balanceOf(address,uint256) = 0x00fdd58e
+            token_id_hex = "0" * 64  # tokenId = 0 for collateral
+            call_data = f"0x00fdd58e{addr_hex}{token_id_hex}"
+            for exchange in [config.CTF_EXCHANGE_ADDRESS, config.NEGRISK_CTF_EXCHANGE]:
+                bal = self._rpc_call_balance(exchange, call_data, f"CTF-{exchange[:10]}")
+                if bal > 0:
+                    return bal
+        except Exception as e:
+            logger.info("CTF Exchange balance query failed: %s", e)
+
+        return 0.0
+
+    def _erc20_balance_of(self, contract: str, addr_hex: str, label: str) -> float:
+        """ERC20 balanceOf 호출."""
+        call_data = f"0x70a08231{addr_hex}"
+        return self._rpc_call_balance(contract, call_data, label)
+
+    def _rpc_call_balance(self, contract: str, call_data: str, label: str) -> float:
+        """Polygon RPC eth_call 실행 후 USDC 잔고 반환."""
+        try:
+            resp = requests.post(
+                config.POLYGON_RPC_URL,
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "eth_call",
+                    "params": [{"to": contract, "data": call_data}, "latest"],
+                    "id": 1,
+                },
+                timeout=10,
+            )
+            result = resp.json().get("result", "0x0")
+            balance = int(result, 16) / 1e6  # USDC = 6 decimals
+            if balance > 0:
+                logger.info("Balance (%s): $%.2f", label, balance)
+            return balance
+        except Exception as e:
+            logger.info("RPC balance query failed (%s): %s", label, e)
+            return 0.0
 
     def get_positions(self) -> List[dict]:
         """보유 포지션 목록을 조회합니다."""
