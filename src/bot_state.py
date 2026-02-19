@@ -190,14 +190,19 @@ class BotState:
         self.current_bet_pct = final
         return final
 
+    def available_balance(self) -> float:
+        """주문 가능한 잔고 (열린 포지션 노출 차감)."""
+        return max(0.0, self.balance - self.total_exposure())
+
     def compute_bet_amount(self, boost: float = 1.0) -> float:
         """Return dollar amount to bet, applying compound logic."""
         pct = self.compute_bet_pct()
         if pct is None:
             return 0.0  # cooldown needed
-        amount = self.balance * pct * boost
+        avail = self.available_balance()
+        amount = avail * pct * boost
         # Cap boost to MAX_BET_PCT
-        max_amount = self.balance * config.MAX_BET_PCT
+        max_amount = avail * config.MAX_BET_PCT
         return min(amount, max_amount)
 
     def _hwm_bet_cap(self) -> Optional[float]:
@@ -352,6 +357,9 @@ class BotState:
         if not self.can_open_more():
             return False
         if self.balance < 1.0:
+            return False
+        # 가용 잔고가 $1 미만이면 추가 진입 불가
+        if self.available_balance() < 1.0:
             return False
         # 총 노출이 잔고의 80%를 넘으면 추가 진입 불가
         if self.total_exposure() >= self.balance * 0.80:

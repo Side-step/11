@@ -502,15 +502,22 @@ class Bot:
         # 멀티 포지션 리스트에 추가
         self.bot.add_position(position)
 
-        # 익절 오더 배치
-        tp_price = round(
-            round(position.tp_price / tick_size) * tick_size, 6)
-        tp_resp = self.poly.place_limit_order(
-            token_id=token_id, price=tp_price, size=size,
-            side="sell", tick_size=tick_size, post_only=False,
-        )
-        if tp_resp and tp_resp.get("orderID"):
-            position.tp_order_id = tp_resp["orderID"]
+        # 익절 오더 배치 (FAK 즉시체결인 경우만 — GTC 리밋은 미체결이므로 TP 불가)
+        order_status = resp.get("status", "")
+        if order_status == "matched":
+            tp_raw = min(position.tp_price, 0.999)  # Polymarket 가격 상한
+            tp_price = round(
+                round(tp_raw / tick_size) * tick_size, 6)
+            tp_price = min(tp_price, 0.999)  # tick 정렬 후 재확인
+            tp_resp = self.poly.place_limit_order(
+                token_id=token_id, price=tp_price, size=size,
+                side="sell", tick_size=tick_size, post_only=False,
+            )
+            if tp_resp and tp_resp.get("orderID"):
+                position.tp_order_id = tp_resp["orderID"]
+        else:
+            log.info("  TP order deferred (buy order status=%s, not yet filled)",
+                     order_status)
 
         log.info(
             "ENTRY [%d/%d]: %s %s @ %.4f, $%.2f, strategy=%s, confluence=%.1f",

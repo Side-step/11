@@ -142,6 +142,11 @@ def evaluate_fifteen_min(
         else:
             continue  # 방향 불일치
 
+        # 가격 범위 체크 (0.05~0.95 벗어나면 이익 여지 없음)
+        buy_price = market.yes_price if direction == "Yes" else market.no_price
+        if buy_price < config.PRICE_MIN or buy_price > config.PRICE_MAX:
+            continue
+
         token_id = (
             market.yes_token_id if direction == "Yes"
             else market.no_token_id

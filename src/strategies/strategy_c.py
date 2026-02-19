@@ -101,6 +101,11 @@ def evaluate_strategy_c(
                 direction = "No" if side == "Yes" else "Yes"
                 eval_dir = "buy"
 
+            # 가격 범위 체크 (0.05~0.95 벗어나면 이익 여지 없음)
+            buy_price = market.yes_price if direction == "Yes" else market.no_price
+            if buy_price < config.PRICE_MIN or buy_price > config.PRICE_MAX:
+                continue
+
             # EMA + MACD 방향 확인 (둘 다 같은 방향이어야 함)
             if state.ema and state.macd:
                 ema_dir = state.ema.signal  # "buy" or "sell"
