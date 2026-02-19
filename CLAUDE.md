@@ -10,10 +10,18 @@ Binance 실시간 가격 + 기술 지표(RSI, EMA, VWAP, BB, MACD, OFI) 기반 �
 - **루프 주기**: 10초
 - **지갑 타입**: Proxy 지갑 (signature_type=1, Magic/이메일 로그인)
 
+## 마켓 구조 (중요!)
+Polymarket 크립토 마켓은 타임스텝별로 자동 생성됨:
+- **5분 마켓**: slug `btc-updown-5m-{timestamp}` — "Bitcoin Up or Down - 7:30-7:35 AM ET"
+- **15분 마켓**: slug `btc-updown-15m-{timestamp}` — "Bitcoin Up or Down - 7:00-7:15 AM ET"
+- **시간/4시간/일간/주간/월간** 마켓도 별도 존재
+- 마켓 페이지: https://polymarket.com/ko/crypto/5M, /15M
+- **5분/15분 마켓은 `order=startDate` 최신순으로만 검색 가능** (volume24hr로는 안 나옴!)
+
 ## API 중요 사항 (공식 문서 기반)
 - **Gamma API** (`gamma-api.polymarket.com`): 마켓 조회
   - `tag=crypto`는 **사용하지 않음** (잘못된 결과 반환)
-  - 볼륨 순 전체 스캔 + `detect_asset()` 클라이언트 필터링 사용
+  - 2단계 수집: ①startDate 최신순(5m/15m) + ②volume24hr순(가격 예측)
   - 응답 필드: camelCase (`conditionId`, `acceptingOrders`, `enableOrderBook`, `clobTokenIds`, `outcomePrices`, `volume24hr`, `negRisk`, `orderPriceMinTickSize`, `secondsDelay`)
   - `clobTokenIds`/`outcomes`/`outcomePrices`는 JSON 문자열 배열
 - **CLOB API** (`clob.polymarket.com`): 주문/오더북/가격
@@ -35,6 +43,8 @@ Binance 실시간 가격 + 기술 지표(RSI, EMA, VWAP, BB, MACD, OFI) 기반 �
 9. `tag=crypto` 마켓 발견 실패 → 볼륨 순 전체 스캔으로 교체
 10. Web3 RPC 연결 실패 → 다중 RPC 폴백
 11. "DOGE" 정부부처 오탐 → bare "DOGE" 제거, "DOGECOIN"만 매칭
+12. `post_order(order_type=...)` → camelCase `orderType` 또는 위치인자 사용
+13. 5분/15분 마켓 미발견 → `order=startDate` 최신순 + slug 패턴(`updown-5m-`/`updown-15m-`) 매칭
 
 ## 현재 설정값
 - 컨플루언스 임계값: 진입=3, 높음=5, 최고=7
