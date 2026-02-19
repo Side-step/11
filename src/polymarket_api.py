@@ -41,7 +41,18 @@ class MarketInfo:
     neg_risk: bool = False
     enable_order_book: bool = True
     accepting_orders: bool = True
-    market_type: str = "Type B"  # "Type A" (5min) or "Type B" (general)
+    market_type: str = "Type B"  # "Type A" (5min/15min) or "Type B" (general)
+    slug: str = ""               # Gamma API 슬러그 (e.g. "btc-updown-5m-1771590900")
+
+    @property
+    def is_5m_updown(self) -> bool:
+        """5분 Up-or-Down 마켓인지 확인."""
+        return "updown-5m-" in self.slug
+
+    @property
+    def is_15m_updown(self) -> bool:
+        """15분 Up-or-Down 마켓인지 확인."""
+        return "updown-15m-" in self.slug
 
     @property
     def is_xrp(self) -> bool:
@@ -113,16 +124,52 @@ class PolymarketClient:
 
     def fetch_crypto_markets(self) -> List[MarketInfo]:
         """
-        Gamma API에서 활성 시장을 볼륨 순으로 가져온 후,
-        클라이언트 측에서 크립토 가격 예측 시장을 필터링합니다.
+        크립토 마켓을 두 가지 소스에서 수집합니다:
 
-        tag=crypto는 잘못된 결과를 반환하므로 사용하지 않습니다.
-        대신 전체 시장을 볼륨 순으로 가져와 detect_asset()으로 필터링합니다.
+        1) 5분/15분 Up-or-Down 마켓 (최신순 정렬, slug에 'updown-5m'/'updown-15m' 포함)
+           → Gamma API order=startDate (최신 마켓이 위로)
+        2) 월간/주간/일간 가격 예측 마켓 (볼륨순)
+           → Gamma API order=volume24hr + detect_asset() 필터링
         """
-        all_markets: List[MarketInfo] = []
+        seen_ids: set = set()
         crypto_markets: List[MarketInfo] = []
 
-        # 페이지네이션으로 충분한 시장 수집 (볼륨 순)
+        # ── 소스 1: 5분/15분 Up-or-Down 마켓 (최신순) ──
+        try:
+            resp = requests.get(
+                f"{config.GAMMA_API}/markets",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "order": "startDate",
+                    "ascending": "false",
+                    "limit": 100,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for m in resp.json():
+                slug = m.get("slug", "")
+                # 5분/15분 Up-or-Down 패턴: btc-updown-5m-*, eth-updown-15m-* 등
+                if "updown-5m-" in slug or "updown-15m-" in slug:
+                    mi = self._parse_market(m)
+                    if mi and not mi.is_xrp:
+                        cid = mi.condition_id
+                        if cid not in seen_ids:
+                            seen_ids.add(cid)
+                            # 슬러그에서 타임프레임 추출
+                            if "updown-5m-" in slug:
+                                mi.market_type = "Type A"  # 5분봉
+                            elif "updown-15m-" in slug:
+                                mi.market_type = "Type A"  # 15분봉
+                            crypto_markets.append(mi)
+        except Exception as e:
+            logger.error("5M/15M market fetch failed: %s", e)
+
+        count_5m = sum(1 for m in crypto_markets if "5m" in (m.tokens[0].get("slug", "") if m.tokens else ""))
+        count_short = len(crypto_markets)
+
+        # ── 소스 2: 월간/주간/일간 가격 예측 마켓 (볼륨순) ──
         for offset in range(0, 600, 100):
             try:
                 resp = requests.get(
@@ -140,30 +187,30 @@ class PolymarketClient:
                 resp.raise_for_status()
                 batch = resp.json()
                 if not batch:
-                    break  # 더 이상 결과 없음
+                    break
 
                 for m in batch:
                     mi = self._parse_market(m)
-                    if mi and not mi.is_xrp:
-                        all_markets.append(mi)
+                    if not mi or mi.is_xrp:
+                        continue
+                    if mi.condition_id in seen_ids:
+                        continue
+                    if config.detect_asset(mi.question):
+                        seen_ids.add(mi.condition_id)
+                        crypto_markets.append(mi)
 
                 if len(batch) < 100:
-                    break  # 마지막 페이지
-
+                    break
             except Exception as e:
-                logger.error("Gamma API fetch failed (offset=%d): %s", offset, e)
+                logger.error("Volume market fetch failed (offset=%d): %s", offset, e)
                 break
 
-        # 클라이언트 측 크립토 필터링
-        for mi in all_markets:
-            asset = config.detect_asset(mi.question)
-            if asset:
-                crypto_markets.append(mi)
-
         logger.info(
-            "Market discovery: %d total active -> %d crypto markets (assets: %s)",
-            len(all_markets),
+            "Market discovery: %d crypto markets "
+            "(%d short-term 5m/15m + %d price prediction) | assets: %s",
             len(crypto_markets),
+            count_short,
+            len(crypto_markets) - count_short,
             ", ".join(sorted(set(
                 config.detect_asset(m.question) or "?"
                 for m in crypto_markets
@@ -275,6 +322,7 @@ class PolymarketClient:
                                   raw.get("enable_order_book", True)),
                 accepting_orders=raw.get("acceptingOrders",
                                  raw.get("accepting_orders", True)),
+                slug=raw.get("slug", ""),
             )
 
             if mi.yes_token_id:
@@ -409,12 +457,16 @@ class PolymarketClient:
 
     # ── 주문 실행 ─────────────────────────────────────────────
 
-    def _get_market_options(self, token_id: str, tick_size: float = 0.01):
-        """마켓 옵션(tickSize, negRisk)을 조회합니다. 공식 문서 필수 파라미터."""
-        neg_risk = self.is_neg_risk(token_id)
-        # tick_size를 문자열로 변환 (공식 문서: "0.1", "0.01", "0.001", "0.0001")
-        ts_str = str(tick_size)
-        return {"tick_size": ts_str, "neg_risk": neg_risk}
+    @staticmethod
+    def _tick_size_str(tick_size: float) -> str:
+        """tick_size를 TickSize 리터럴 문자열로 변환. ('0.1'|'0.01'|'0.001'|'0.0001')"""
+        if tick_size >= 0.1:
+            return "0.1"
+        elif tick_size >= 0.01:
+            return "0.01"
+        elif tick_size >= 0.001:
+            return "0.001"
+        return "0.0001"
 
     def _parse_order_resp(self, resp, label: str) -> Optional[Dict[str, Any]]:
         """주문 응답을 파싱합니다."""
@@ -455,18 +507,21 @@ class PolymarketClient:
 
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY, SELL
+
+            # tick_size 문자열 변환 (TickSize = "0.1" | "0.01" | "0.001" | "0.0001")
+            ts_str = self._tick_size_str(tick_size)
 
             # tick_size 배수로 가격 정렬
             price = round(round(price / tick_size) * tick_size, 6)
 
-            order_side = BUY if side.lower() == "buy" else SELL
             order_args = OrderArgs(
                 price=price,
                 size=size,
-                side=order_side,
+                side="BUY" if side.lower() == "buy" else "SELL",
                 token_id=token_id,
             )
+
+            # create_order: tick_size/neg_risk를 전달하지 않으면 API에서 자동 조회
             signed = self._clob_client.create_order(order_args)
             resp = self._clob_client.post_order(signed, OrderType.GTC)
             result = self._parse_order_resp(resp, "LIMIT")
@@ -500,14 +555,12 @@ class PolymarketClient:
 
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY, SELL
 
             price = round(round(price / tick_size) * tick_size, 6)
-            order_side = BUY if side.lower() == "buy" else SELL
             order_args = OrderArgs(
                 price=price,
                 size=size,
-                side=order_side,
+                side="BUY" if side.lower() == "buy" else "SELL",
                 token_id=token_id,
             )
             signed = self._clob_client.create_order(order_args)

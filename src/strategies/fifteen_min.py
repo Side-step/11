@@ -36,13 +36,16 @@ class FifteenMinSignal:
 
 
 def is_fifteen_min_market(market: MarketInfo) -> bool:
-    """크립토 관련 시장인지 판별합니다 (모든 크립토 마켓 대상)."""
+    """15분 Up-or-Down 마켓 또는 크립토 가격 마켓인지 판별합니다."""
     if not market.accepting_orders or not market.enable_order_book:
         return False
     if market.is_xrp or market.closed:
         return False
     if market.seconds_delay > 0:
         return False
+    # 15분 Up-or-Down 마켓 우선
+    if market.is_15m_updown:
+        return True
     return config.detect_asset(market.question) is not None
 
 
