@@ -144,11 +144,23 @@ class ScalpingOrchestrator:
 
     async def _trading_loop(self):
         """10초 주기 트레이딩 루프."""
+        tick_count = 0
         while self._running:
             try:
                 await self._tick()
             except Exception as e:
                 logger.error("Trading loop error: %s", e, exc_info=True)
+            tick_count += 1
+            # 5분(30틱)마다 상태 로그 출력
+            if tick_count % 30 == 0:
+                logger.info(
+                    "HEARTBEAT: balance=$%.2f | positions=%d/%d | "
+                    "markets=%d | phase=%s | streak=W%d/L%d",
+                    self.bot.balance, self.bot.position_count(),
+                    config.MAX_CONCURRENT_POSITIONS,
+                    len(self._markets), self.bot.phase.value,
+                    self.bot.consecutive_wins, self.bot.consecutive_losses,
+                )
             await asyncio.sleep(self._loop_interval)
 
     async def _tick(self):
