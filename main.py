@@ -1,33 +1,45 @@
 #!/usr/bin/env python3
 """
-Polymarket v8.0 — AI Prediction-Based Auto-Trading Bot
-10-source ensemble prediction model for Polymarket BTC/ETH/SOL/DOGE
-5-min and 15-min binary (Up/Down) markets using Binance real-time data.
-Supports hedged (both-side) and single-direction betting strategies.
+Polymarket v8.0 — 크립토 복리 스캘핑 봇.
+
+v3.0 스캘핑 전략 (5분봉/15분봉/전략A/전략C + 컨플루언스 + 복리 + 적응학습)
++ v8.0 봇 라이프사이클 (깔끔한 시작/루프/종료, 마켓 발견 참고).
+
+의사결정 우선순위: 5분봉 > 15분봉 > 전략A > 전략C
+동시 포지션: 최대 4개
 """
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
+from datetime import datetime, timezone
+from typing import Optional
 
-import config as cfg
-from data_collector import DataCollector
-from predictor import Predictor, Direction
-from risk_manager import RiskManager
-from trader import Trader
-from notifier import Notifier
+from src import config
+from src.adaptive_learning import AdaptiveLearningEngine
+from src.auto_redeem import AutoRedeemer
+from src.binance_feed import BinanceFeed
+from src.bot_state import BotPhase, BotState, ExitReason, Position
+from src.confluence import compute_confluence, build_snapshot
+from src.polymarket_api import MarketInfo, PolymarketClient
+from src.risk_manager import RiskManager
+from src.strategies.five_min import FiveMinSignal, evaluate_five_min
+from src.strategies.fifteen_min import FifteenMinSignal, evaluate_fifteen_min
+from src.strategies.strategy_a import StrategyASignal, evaluate_strategy_a
+from src.strategies.strategy_c import StrategyCSignal, evaluate_strategy_c
+from src.telegram_bot import TelegramNotifier
 
-# ── Logging setup ───────────────────────────────────────────────
+# ── Logging ─────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler(cfg.LOG_FILE),
+        logging.FileHandler("bot.log", mode="a"),
         logging.StreamHandler(sys.stdout),
     ],
 )
-# Silence noisy HTTP request logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -38,472 +50,536 @@ log = logging.getLogger("bot")
 
 
 class Bot:
+    """v8.0 라이프사이클 + v3.0 스캘핑 전략."""
+
     def __init__(self):
-        self.collector = DataCollector()
-        self.predictor = Predictor()
-        self.risk = RiskManager()
-        self.trader = Trader()
-        self.notifier = Notifier()
+        # v3.0 핵심 컴포넌트
+        self.poly = PolymarketClient()
+        self.feed = BinanceFeed()
+        self.bot = BotState()
+        self.risk: Optional[RiskManager] = None
+        self.learning = AdaptiveLearningEngine()
+        self.redeemer = AutoRedeemer()
+        self.telegram = TelegramNotifier()
+
+        # 마켓 캐시
+        self._markets: list[MarketInfo] = []
+        self._last_full_scan: float = 0.0
+
+        # 루프 제어
         self._running = False
         self._cycle = 0
 
-        # Loss cooldown
-        self._daily_start_bankroll: float = 0.0
-        self._daily_start_pnl: float = 0.0
-        self._daily_date: int = 0
-        self._cooldown_until: float = 0.0
-        self._cooldown_count: int = 0
-
-        # Prediction accuracy
-        self._predictions: dict = {}  # condition_id → predicted direction
-        self._pred_correct: int = 0
-        self._pred_total: int = 0
+    # ── 부팅 ────────────────────────────────────────────────────
 
     async def run(self):
         self._running = True
         log.info("=" * 60)
-        log.info("Polymarket v8.0 starting")
-        log.info("Coins: %s", ", ".join(cfg.COINS.keys()))
-        log.info(
-            "Max positions: %d | Kelly fraction: %.0f%%",
-            cfg.MAX_OPEN_POSITIONS, cfg.KELLY_FRACTION * 100,
-        )
+        log.info("Polymarket Scalping Bot v8.0")
+        log.info("Mode: %s | Max Positions: %d",
+                 config.OPERATION_MODE, config.MAX_CONCURRENT_POSITIONS)
         log.info("=" * 60)
 
-        # Start all components
-        await self.collector.start()
-        await self.trader.start()
-        await self.notifier.start()
+        # 1) Polymarket 클라이언트 초기화
+        if not self.poly.initialize():
+            log.error("BOOT FAILED: Polymarket client init failed")
+            return
 
-        # Restore cooldown state
-        self._cooldown_until = getattr(self.trader, "_cooldown_until", 0.0)
-        if self._cooldown_until > time.time():
-            remaining = (self._cooldown_until - time.time()) / 60
-            log.warning(
-                "COOLDOWN RESTORED: %.0f min remaining (from previous session)",
-                remaining,
-            )
+        # 2) 잔고 확인
+        balance = self.poly.get_balance()
+        env_capital = float(os.environ.get("INITIAL_CAPITAL", 0))
+        if env_capital > 0:
+            initial = env_capital
+        elif balance > 0:
+            initial = balance
+        else:
+            log.warning("Balance query returned $0 — using $200 default")
+            initial = 200.0
 
-        # Wait for data to accumulate
-        log.info("Warming up data streams (30s)...")
-        await asyncio.sleep(30)
+        self.bot = BotState(initial_balance=initial)
+        self.risk = RiskManager(self.bot, self.feed, self.poly)
+        log.info("STEP 1: Balance = $%.2f (source: %s)",
+                 self.bot.balance,
+                 "env" if env_capital > 0 else ("api" if balance > 0 else "default"))
 
-        # Startup notification
+        # 3) 마켓 스캔
+        self._markets = self.poly.fetch_crypto_markets()
+        self._last_full_scan = time.time()
+        log.info("STEP 2: Found %d crypto markets", len(self._markets))
+
+        # 4) Binance 과거 데이터 로드
+        self.feed.load_historical()
+        log.info("STEP 3: Binance historical data loaded (1m/5m/15m)")
+
+        # 5) 학습 엔진 초기화
+        self.learning.initialize()
+        log.info("STEP 4: Learning engine initialized (%d trades)",
+                 self.learning._trade_count)
+
+        # 6) Auto-Redeemer
+        self.redeemer.initialize()
+
+        self.bot.phase = BotPhase.RUNNING
+        log.info("BOOT COMPLETE - Trading loop starting (max %d positions)",
+                 config.MAX_CONCURRENT_POSITIONS)
+
+        # 부팅 알림
+        await self.telegram.notify_boot(self.bot)
+
+        # 백그라운드 태스크 시작
+        tasks = [
+            asyncio.create_task(self.feed.start_websocket()),
+            asyncio.create_task(self.redeemer.start_loop()),
+            asyncio.create_task(self._trading_loop()),
+            asyncio.create_task(self._daily_tasks()),
+            asyncio.create_task(self.telegram.start_polling(self.bot)),
+        ]
+
         try:
-            bankroll = await self.trader.get_balance()
-            positions = self.trader.open_position_count()
-            pending = len(self.trader.pending_hedges)
-            cooldown_msg = ""
-            if self._cooldown_until > time.time():
-                remaining = (self._cooldown_until - time.time()) / 60
-                cooldown_msg = f"\nCooldown: {remaining:.0f}min remaining"
-
-            startup_msg = (
-                f"<b>pbot v8.0 started</b>\n"
-                f"Bankroll: ${bankroll:.2f}\n"
-                f"Open positions: {positions}\n"
-                f"Pending hedges: {pending}\n"
-                f"Coins: {', '.join(c.upper() for c in cfg.COINS)}\n"
-                f"Hedge: {'ON' if cfg.HEDGE_ENABLED else 'OFF'} | "
-                f"Stagger: {'ON' if cfg.STAGGER_ENABLED else 'OFF'}"
-                f"{cooldown_msg}"
-            )
-            await self.notifier.send(startup_msg)
-            if self.notifier.enabled:
-                log.info("Startup notification sent (bankroll=$%.2f)", bankroll)
-            else:
-                log.info("Ready (bankroll=$%.2f) — Telegram disabled", bankroll)
-        except Exception as e:
-            log.warning("Startup notification failed: %s", e)
-
-        try:
-            while self._running:
-                await self._cycle_once()
-                if self.trader.pending_hedges:
-                    await asyncio.sleep(cfg.STAGGER_POLL_SEC)
-                else:
-                    await asyncio.sleep(cfg.SCAN_INTERVAL_SEC)
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
-            pass
+            log.info("Bot shutting down")
         finally:
-            await self._shutdown()
+            self._running = False
+            self.feed.stop()
+            self.redeemer.stop()
 
-    async def _cycle_once(self):
-        self._cycle += 1
-        log.info("--- Cycle %d ---", self._cycle)
+    # ── 트레이딩 루프 ──────────────────────────────────────────
 
-        try:
-            # 1. Clean up expired markets
-            self.trader.cleanup_expired()
+    async def _trading_loop(self):
+        """10초 주기 트레이딩 루프."""
+        while self._running:
+            try:
+                await self._tick()
+            except Exception as e:
+                log.exception("Trading loop error: %s", e)
 
-            # 2. Discover new markets
-            new_markets = await self.trader.discover_markets()
-            if new_markets:
-                log.info("Found %d new market(s)", len(new_markets))
-            elif self._cycle % 20 == 0:
-                log.info("No new crypto markets found")
+            self._cycle += 1
 
-            # 3. Refresh prices on tracked markets
-            await self.trader.refresh_prices()
-
-            # 4. Check settlements on expired positions
-            settled = await self.trader.check_settlements()
-            if settled:
-                market_pnl: dict[str, float] = {}
-                for pos in settled:
-                    cid = pos.market.condition_id
-                    market_pnl[cid] = market_pnl.get(cid, 0.0) + pos.pnl
-
-                self.risk.open_positions = self.trader.open_position_count()
-
-                # Prediction accuracy tracking
-                for cid in market_pnl:
-                    predicted = self._predictions.pop(cid, None)
-                    if predicted:
-                        primary_pos = next(
-                            (p for p in settled if p.market.condition_id == cid),
-                            None,
-                        )
-                        if primary_pos:
-                            self._pred_total += 1
-                            if primary_pos.pnl > 0:
-                                self._pred_correct += 1
-                            accuracy = (
-                                self._pred_correct / self._pred_total * 100
-                                if self._pred_total > 0 else 0
-                            )
-                            log.info(
-                                "PREDICTION: %s predicted=%s pnl=$%.2f | "
-                                "accuracy=%d/%d (%.1f%%)",
-                                primary_pos.market.coin_key, predicted,
-                                primary_pos.pnl,
-                                self._pred_correct, self._pred_total, accuracy,
-                            )
-
-                # Notify per market
-                notified: set[str] = set()
-                for pos in settled:
-                    cid = pos.market.condition_id
-                    if cid in notified:
-                        continue
-                    notified.add(cid)
-                    combined = market_pnl[cid]
-                    await self.notifier.trade_settled(
-                        pos.market.coin_key, pos.direction, combined
-                    )
-                    log.info(
-                        "Settlement: %s combined PnL=$%.2f (total=$%.2f)",
-                        pos.market.coin_key, combined, self.trader.total_pnl,
-                    )
-
-            # 5. Monitor pending staggered hedges
-            if cfg.STAGGER_ENABLED and cfg.HEDGE_ENABLED:
-                placed = await self.trader.monitor_pending_hedges()
-                for ph in placed:
-                    if ph.hedge and ph.hedge.filled:
-                        improvement = self.risk.calc_staggered_improvement(
-                            primary_amount=ph.primary.amount_usd if ph.primary else 0,
-                            primary_price=ph.primary.entry_price if ph.primary else 0,
-                            hedge_amount=ph.hedge_amount,
-                            initial_hedge_price=ph.initial_hedge_price,
-                            current_hedge_price=ph.hedge.entry_price,
-                        )
-                        await self.notifier.staggered_hedge_placed(
-                            coin=ph.market.coin_key,
-                            hedge_dir=ph.hedge_dir,
-                            amount=ph.hedge_amount,
-                            initial_price=ph.initial_hedge_price,
-                            final_price=ph.hedge.entry_price,
-                            improvement=improvement,
-                        )
-                        log.info(
-                            "STAGGER COMPLETE: %s hedge placed @ %.3f "
-                            "(was %.3f, improvement=%.3f, extra=$%.2f)",
-                            ph.market.coin_key, ph.hedge.entry_price,
-                            ph.initial_hedge_price,
-                            improvement.price_improvement,
-                            improvement.odds_profit,
-                        )
-                    elif not ph.hedge or not ph.hedge.filled:
-                        log.warning(
-                            "STAGGER EXPOSED: %s hedge failed",
-                            ph.market.coin_key,
-                        )
-                        await self.notifier.error(
-                            f"STAGGER WARNING: {ph.market.coin_key} hedge failed. "
-                            f"Primary ${ph.primary.amount_usd:.2f} unhedged."
-                            if ph.primary else
-                            f"STAGGER WARNING: {ph.market.coin_key} hedge failed."
-                        )
-
-            # 6. Evaluate each market for trading opportunity
-            bankroll = await self.trader.get_balance()
-            self.risk.open_positions = self.trader.open_position_count()
-
-            # Loss cooldown circuit breaker
-            now_ts = time.time()
-            today = int(now_ts // 86400)
-            if today != self._daily_date:
-                self._daily_date = today
-                self._daily_start_bankroll = bankroll
-                self._daily_start_pnl = self.trader.total_pnl
-                self._cooldown_count = 0
-                log.info("New trading day — bankroll=$%.2f", bankroll)
-
-            in_cooldown = self._cooldown_until > now_ts
-            if not in_cooldown and self._cooldown_until > 0:
+            # 5분(30틱)마다 하트비트
+            if self._cycle % 30 == 0:
                 log.info(
-                    "COOLDOWN ENDED: resuming trades (was paused %.0f min)",
-                    cfg.LOSS_COOLDOWN_SEC / 60,
-                )
-                self._cooldown_until = 0.0
-                self._daily_start_pnl = self.trader.total_pnl
-
-            if not in_cooldown:
-                daily_loss = self._daily_start_pnl - self.trader.total_pnl
-                if (self._daily_start_bankroll > 0
-                        and daily_loss > self._daily_start_bankroll * cfg.MAX_DAILY_LOSS_PCT):
-                    self._cooldown_until = now_ts + cfg.LOSS_COOLDOWN_SEC
-                    self._cooldown_count += 1
-                    in_cooldown = True
-                    minutes = cfg.LOSS_COOLDOWN_SEC / 60
-                    log.warning(
-                        "LOSS COOLDOWN #%d: $%.2f loss (%.1f%% of $%.2f) — "
-                        "pausing new trades for %.0f min (until %s)",
-                        self._cooldown_count, daily_loss,
-                        daily_loss / self._daily_start_bankroll * 100,
-                        self._daily_start_bankroll, minutes,
-                        time.strftime("%H:%M", time.localtime(self._cooldown_until)),
-                    )
-                    await self.notifier.error(
-                        f"Loss cooldown #{self._cooldown_count}: "
-                        f"${daily_loss:.2f} loss "
-                        f"({daily_loss / self._daily_start_bankroll * 100:.1f}%). "
-                        f"Pausing {minutes:.0f} min."
-                    )
-
-            for cid, market in list(self.trader.markets.items()):
-                if in_cooldown:
-                    break
-
-                # Skip markets too close to expiry
-                time_left = market.end_time - time.time()
-                if market.end_time > 0 and time_left < cfg.MIN_TIME_TO_EXPIRY:
-                    continue
-
-                # Skip if already have position in this market
-                if any(p.market.condition_id == cid and not p.settled
-                       for p in self.trader.positions):
-                    continue
-
-                # Skip if pending staggered hedge exists
-                if self.trader.has_pending_hedge(cid):
-                    continue
-
-                # Skip if Binance data is stale
-                if self.collector.is_stale(market.coin_key):
-                    log.debug(
-                        "SKIP %s: data stale (>%ds old)",
-                        market.coin_key, cfg.DATA_STALE_SEC,
-                    )
-                    continue
-
-                # Get prediction
-                signals = self.collector.get_signals(market.coin_key)
-                prediction = self.predictor.predict(signals)
-
-                if prediction.direction == Direction.SKIP:
-                    continue
-
-                # Determine prices for both sides
-                if prediction.direction == Direction.UP:
-                    primary_price = market.yes_bid if market.yes_bid > 0 else market.yes_price
-                    hedge_price = market.no_bid if market.no_bid > 0 else market.no_price
-                    hedge_dir = "DOWN"
-                else:
-                    primary_price = market.no_bid if market.no_bid > 0 else market.no_price
-                    hedge_price = market.yes_bid if market.yes_bid > 0 else market.yes_price
-                    hedge_dir = "UP"
-
-                # Track prediction for accuracy
-                self._predictions[cid] = prediction.direction.value
-
-                if cfg.HEDGE_ENABLED:
-                    if cfg.STAGGER_ENABLED and time_left > cfg.STAGGER_MIN_TIME_BEFORE_EXPIRY:
-                        await self._execute_staggered_hedge(
-                            market, prediction, primary_price, hedge_price,
-                            hedge_dir, bankroll,
-                        )
-                    else:
-                        await self._execute_hedge(
-                            market, prediction, primary_price, hedge_price,
-                            hedge_dir, bankroll,
-                        )
-                else:
-                    await self._execute_single(
-                        market, prediction, primary_price, bankroll,
-                    )
-
-            # 7. Periodic status update (every 20 cycles)
-            if self._cycle % 20 == 0:
-                accuracy = (
-                    self._pred_correct / self._pred_total * 100
-                    if self._pred_total > 0 else 0
-                )
-                daily_pnl = self.trader.total_pnl - self._daily_start_pnl
-                await self.notifier.status(
-                    bankroll=bankroll,
-                    positions=self.risk.open_positions,
-                    total_pnl=self.trader.total_pnl,
-                )
-                cooldown_status = (
-                    f"cooldown until {time.strftime('%H:%M', time.localtime(self._cooldown_until))}"
-                    if self._cooldown_until > time.time()
-                    else "active"
-                )
-                log.info(
-                    "STATUS: bankroll=$%.2f positions=%d total_pnl=$%.2f "
-                    "daily_pnl=$%.2f prediction=%d/%d (%.1f%%) trading=%s",
-                    bankroll, self.risk.open_positions,
-                    self.trader.total_pnl, daily_pnl,
-                    self._pred_correct, self._pred_total, accuracy,
-                    cooldown_status,
+                    "HEARTBEAT: balance=$%.2f | positions=%d/%d | "
+                    "markets=%d | phase=%s | streak=W%d/L%d",
+                    self.bot.balance, self.bot.position_count(),
+                    config.MAX_CONCURRENT_POSITIONS,
+                    len(self._markets), self.bot.phase.value,
+                    self.bot.consecutive_wins, self.bot.consecutive_losses,
                 )
 
-        except Exception as e:
-            log.exception("Cycle error: %s", e)
-            await self.notifier.error(str(e))
+            await asyncio.sleep(10)
 
-    async def _execute_hedge(self, market, prediction, primary_price,
-                               hedge_price, hedge_dir, bankroll):
-        """Place a hedged bet with fill-safety protocol."""
-        decision = self.risk.evaluate_hedge(
-            confidence=prediction.confidence,
-            primary_price=primary_price,
-            hedge_price=hedge_price,
-            bankroll=bankroll,
-        )
-        if not decision.approved:
-            log.info("Skip %s %s: %s",
-                     market.coin_key, prediction.direction.value, decision.reason)
+    async def _tick(self):
+        """단일 트레이딩 틱."""
+
+        # 1. 쿨다운 체크
+        if self.bot.phase == BotPhase.COOLDOWN:
+            if self.risk.check_restart():
+                await self.telegram.notify_restart(
+                    True, self.bot.balance, self.bot.current_bet_pct)
             return
 
-        pair = await self.trader.buy_hedge_pair(
-            market=market,
-            primary_dir=prediction.direction.value,
-            hedge_dir=hedge_dir,
-            primary_amount=decision.primary_amount,
-            hedge_amount=decision.hedge_amount,
-        )
-        if pair.primary and pair.primary.filled:
-            self.risk.open_positions += 1
-            fill_status = "BOTH" if pair.hedge_filled else "PRIMARY_ONLY"
-            await self.notifier.hedge_opened(
-                coin=market.coin_key,
-                direction=prediction.direction.value,
-                primary=decision.primary_amount,
-                hedge=decision.hedge_amount,
-                primary_price=primary_price,
-                hedge_price=hedge_price,
-                score=prediction.score,
-                guaranteed=decision.guaranteed,
-            )
-            log.info(
-                "HEDGE[%s]: %s %s primary=$%.2f@%.3f hedge=$%.2f@%.3f "
-                "(ensemble=%+.4f, conf=%.2f, net=$%.2f)",
-                fill_status, market.coin_key, prediction.direction.value,
-                decision.primary_amount, primary_price,
-                decision.hedge_amount, hedge_price,
-                prediction.score, prediction.confidence,
-                decision.net_profit,
-            )
-        elif not pair.primary:
-            log.info("NO FILL: %s — both legs cancelled, no exposure",
-                     market.coin_key)
-
-    async def _execute_staggered_hedge(self, market, prediction, primary_price,
-                                         hedge_price, hedge_dir, bankroll):
-        """Place primary bet now, schedule hedge for later at better odds."""
-        decision = self.risk.evaluate_hedge(
-            confidence=prediction.confidence,
-            primary_price=primary_price,
-            hedge_price=hedge_price,
-            bankroll=bankroll,
-            stagger=True,
-        )
-        if not decision.approved:
-            log.info("Skip %s %s: %s",
-                     market.coin_key, prediction.direction.value, decision.reason)
+        if self.bot.phase != BotPhase.RUNNING:
             return
 
-        pending = await self.trader.buy_staggered_primary(
-            market=market,
-            primary_dir=prediction.direction.value,
-            primary_amount=decision.primary_amount,
-            hedge_dir=hedge_dir,
-            hedge_amount=decision.hedge_amount,
-            hedge_price=hedge_price,
-        )
-        if pending and pending.primary:
-            self.risk.open_positions += 1
-            await self.notifier.staggered_primary_placed(
-                coin=market.coin_key,
-                direction=prediction.direction.value,
-                primary_amount=decision.primary_amount,
-                primary_price=primary_price,
-                hedge_amount=decision.hedge_amount,
-                hedge_price=hedge_price,
-                score=prediction.score,
-            )
-            log.info(
-                "STAGGER[PRIMARY]: %s %s primary=$%.2f@%.3f "
-                "hedge=$%.2f pending (initial_price=%.3f)",
-                market.coin_key, prediction.direction.value,
-                decision.primary_amount, primary_price,
-                decision.hedge_amount, hedge_price,
-            )
-
-    async def _execute_single(self, market, prediction, token_price, bankroll):
-        """Place a single-direction bet (no hedge)."""
-        decision = self.risk.evaluate(
-            confidence=prediction.confidence,
-            market_price=token_price,
-            bankroll=bankroll,
-        )
-        if not decision.approved:
-            log.info("Skip %s %s: %s",
-                     market.coin_key, prediction.direction.value, decision.reason)
+        # 2. 비상 체크
+        emergency = self.risk.check_emergency()
+        if emergency:
+            self.risk.handle_emergency(emergency)
+            cooldown_until = time.time() + 900
+            await self.telegram.notify_emergency(
+                emergency, self.bot.balance, cooldown_until)
             return
 
-        pos = await self.trader.buy(
-            market=market,
-            direction=prediction.direction.value,
-            amount_usd=decision.bet_amount,
+        # 3. 모든 열린 포지션 관리
+        await self._manage_all_positions()
+
+        # 4. 추가 포지션 진입 가능 여부
+        if not self.bot.can_trade():
+            return
+
+        # 5. 마켓 스캔 (5분마다)
+        await self._refresh_markets()
+
+        # 6. 신호 평가 (우선순위: 5분봉 > 15분봉 > A > C)
+        await self._evaluate_signals()
+
+    # ── 포지션 관리 ─────────────────────────────────────────────
+
+    async def _manage_all_positions(self):
+        """모든 열린 포지션을 순회하며 관리."""
+        for pos in list(self.bot.positions):
+            # 현재 가격 업데이트
+            price = self.poly.get_midpoint(pos.token_id)
+            if price > 0:
+                pos.current_price = price
+
+            # 포지션 관리 (TP/SL/트레일링/시간제한)
+            exit_reason = self.risk.manage_position(pos)
+
+            # 지표 역전 체크
+            if not exit_reason:
+                exit_reason = self._check_indicator_reversal(pos)
+
+            if exit_reason:
+                await self._close_position(pos, exit_reason)
+
+    def _check_indicator_reversal(self, pos: Position) -> Optional[ExitReason]:
+        """지표 역전으로 인한 청산 필요 여부를 확인."""
+        asset_state = self.feed.get_state(
+            config.detect_asset(pos.market_question) or "BTC"
         )
-        if pos:
-            self.risk.open_positions += 1
-            await self.notifier.trade_opened(
-                coin=market.coin_key,
-                direction=prediction.direction.value,
-                amount=decision.bet_amount,
-                price=token_price,
-                score=prediction.score,
+        if not asset_state:
+            return None
+
+        reverse_dir = "sell" if pos.direction == "Yes" else "buy"
+        from src.indicators.orderbook import compute_ofi
+        bids, asks = self.poly.get_orderbook(pos.token_id)
+        ofi = compute_ofi(bids, asks) if bids and asks else None
+
+        reverse_score = compute_confluence(
+            direction=reverse_dir,
+            rsi_1m=asset_state.rsi_1m,
+            rsi_5m=asset_state.rsi_5m,
+            ema=asset_state.ema,
+            vwap=asset_state.vwap,
+            bb=asset_state.bollinger,
+            macd=asset_state.macd,
+            volume=asset_state.volume_ratio,
+            ofi=ofi,
+        )
+        if reverse_score.total >= 7:
+            return ExitReason.INDICATOR_REVERSAL
+        return None
+
+    async def _close_position(self, pos: Position, reason: ExitReason):
+        """포지션을 청산하고 결과를 기록."""
+        old_pct = self.bot.current_bet_pct
+        self.risk.execute_exit(pos, reason)
+
+        # 학습 데이터 기록
+        snapshot = {
+            "trade_id": f"T-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "market_type": pos.market_type,
+            "strategy": pos.strategy,
+            "asset": config.detect_asset(pos.market_question) or "BTC",
+            "direction": pos.direction,
+            "indicators": {},
+            "context": {
+                "hour_utc": datetime.now(timezone.utc).hour,
+                "confluence_score": pos.confluence_score,
+                "streak": self.bot.consecutive_wins or -self.bot.consecutive_losses,
+                "hwm_drawdown": self.bot.hwm_drawdown_pct() * 100,
+                "open_positions": self.bot.position_count(),
+            },
+            "result": {
+                "outcome": "win" if pos.pnl_usd >= 0 else "loss",
+                "pnl_pct": pos.pnl_pct * 100,
+                "pnl_usd": pos.pnl_usd,
+                "hold_time_sec": pos.hold_time_sec,
+                "exit_type": reason.value,
+            },
+        }
+        self.learning.record_trade(snapshot)
+
+        # 텔레그램 알림
+        await self.telegram.notify_exit(self.bot, pos, reason)
+
+        # 베팅 비율 변경 알림
+        new_pct = self.bot.current_bet_pct
+        if new_pct != old_pct:
+            reason_str = (f"{self.bot.consecutive_wins}연승"
+                          if self.bot.consecutive_wins > 0
+                          else f"{self.bot.consecutive_losses}연패")
+            next_bet = self.bot.balance * new_pct
+            await self.telegram.notify_bet_change(
+                old_pct, new_pct, reason_str, next_bet)
+
+    # ── 신호 평가 (v3.0 전략 파이프라인) ───────────────────────
+
+    async def _evaluate_signals(self):
+        """전략 우선순위에 따라 진입 신호를 평가. 최대 4개 포지션."""
+        if not self.bot.can_trade():
+            return
+
+        aw = self.learning.get_adaptive_weights()
+        blend = self.learning.get_blend_ratio()
+
+        # 5분봉 시장 우선
+        five_min_signal = evaluate_five_min(
+            self.bot, self.feed, self.poly, self._markets,
+            adaptive_weights=aw, blend_ratio=blend,
+        )
+        if five_min_signal:
+            await self._execute_entry_5min(five_min_signal)
+            if not self.bot.can_trade():
+                return
+
+        # 15분봉 시장
+        fifteen_min_signal = evaluate_fifteen_min(
+            self.bot, self.feed, self.poly, self._markets,
+            adaptive_weights=aw, blend_ratio=blend,
+        )
+        if fifteen_min_signal:
+            await self._execute_entry_15min(fifteen_min_signal)
+            if not self.bot.can_trade():
+                return
+
+        # 전략 A: 크립토 가격 연동
+        signal_a = evaluate_strategy_a(
+            self.bot, self.feed, self.poly, self._markets,
+            adaptive_weights=aw, blend_ratio=blend,
+        )
+        if signal_a:
+            await self._execute_entry_a(signal_a)
+            if not self.bot.can_trade():
+                return
+
+        # 전략 C: 오더북 불균형 (보조)
+        if not self.bot.hwm_restricts_strategy():
+            signal_c = evaluate_strategy_c(
+                self.bot, self.feed, self.poly, self._markets,
+                adaptive_weights=aw, blend_ratio=blend,
             )
-            log.info(
-                "TRADE: %s %s $%.2f @ %.3f (ensemble=%+.4f, conf=%.2f)",
-                market.coin_key, prediction.direction.value,
-                decision.bet_amount, token_price,
-                prediction.score, prediction.confidence,
+            if signal_c:
+                await self._execute_entry_c(signal_c)
+
+    # ── 진입 실행 ──────────────────────────────────────────────
+
+    async def _execute_entry_5min(self, signal: FiveMinSignal):
+        """5분봉 전략 진입."""
+        bet_amount = self.bot.compute_bet_amount(boost=signal.confluence.boost_factor)
+        if bet_amount <= 0:
+            return
+
+        ok, reason = self.risk.validate_entry(
+            "Type A", "5min", bet_amount,
+            market_id=signal.market.condition_id,
+        )
+        if not ok:
+            return
+
+        await self._place_entry(
+            market=signal.market, direction=signal.direction,
+            bet_amount=bet_amount, strategy="5min", market_type="Type A",
+            confluence_score=signal.confluence.total,
+            boost_factor=signal.confluence.boost_factor,
+        )
+
+    async def _execute_entry_15min(self, signal: FifteenMinSignal):
+        """15분봉 전략 진입."""
+        bet_amount = self.bot.compute_bet_amount(boost=signal.confluence.boost_factor)
+        if bet_amount <= 0:
+            return
+
+        ok, reason = self.risk.validate_entry(
+            "Type A", "15min", bet_amount,
+            market_id=signal.market.condition_id,
+        )
+        if not ok:
+            return
+
+        await self._place_entry(
+            market=signal.market, direction=signal.direction,
+            bet_amount=bet_amount, strategy="15min", market_type="Type A",
+            confluence_score=signal.confluence.total,
+            boost_factor=signal.confluence.boost_factor,
+        )
+
+    async def _execute_entry_a(self, signal: StrategyASignal):
+        """전략 A 진입."""
+        bet_amount = self.bot.compute_bet_amount(boost=signal.confluence.boost_factor)
+        if bet_amount <= 0:
+            return
+
+        # 패턴 체크 (적응형 학습)
+        loss_mult = self.learning.check_loss_pattern(
+            signal.snapshot.to_dict(), {})
+        if loss_mult is None:
+            log.info("Strategy A blocked by loss pattern")
+            return
+        win_mult = self.learning.check_win_pattern(signal.snapshot.to_dict(), {})
+        bet_amount *= loss_mult * win_mult
+
+        ok, reason = self.risk.validate_entry(
+            "Type B", "A", bet_amount,
+            market_id=signal.market.condition_id,
+        )
+        if not ok:
+            log.debug("Entry blocked: %s", reason)
+            return
+
+        await self._place_entry(
+            market=signal.market, direction=signal.direction,
+            bet_amount=bet_amount, strategy="A",
+            market_type=signal.market.market_type,
+            confluence_score=signal.confluence.total,
+            boost_factor=signal.confluence.boost_factor,
+        )
+
+    async def _execute_entry_c(self, signal: StrategyCSignal):
+        """전략 C 진입 (보조, 베팅 축소)."""
+        bet_amount = self.bot.compute_bet_amount() * config.STRATEGY_C_BET_MULTIPLIER
+        if bet_amount <= 0:
+            return
+
+        ok, reason = self.risk.validate_entry(
+            "Type B", "C", bet_amount,
+            market_id=signal.market.condition_id,
+        )
+        if not ok:
+            return
+
+        await self._place_entry(
+            market=signal.market, direction=signal.direction,
+            bet_amount=bet_amount, strategy="C", market_type="Type B",
+            confluence_score=signal.confluence.total, boost_factor=1.0,
+        )
+
+    async def _place_entry(
+        self, market: MarketInfo, direction: str, bet_amount: float,
+        strategy: str, market_type: str, confluence_score: float,
+        boost_factor: float,
+    ):
+        """실제 주문을 제출하고 포지션을 생성."""
+        token_id = market.yes_token_id if direction == "Yes" else market.no_token_id
+        if not token_id:
+            log.warning("No token ID for %s %s", direction, market.question[:40])
+            return
+        tick_size = market.tick_size or 0.01
+
+        # 진입 가격 결정
+        price = self.poly.get_price(token_id, side="buy")
+        if price <= 0:
+            return
+
+        # 주식 수 계산
+        size = bet_amount / price if price > 0 else 0
+        if size <= 0:
+            return
+
+        # tick_size 배수 정렬
+        aligned_price = round(round(price / tick_size) * tick_size, 6)
+
+        # GTC + postOnly 리밋 주문 (메이커 수수료 0%)
+        resp = self.poly.place_limit_order(
+            token_id=token_id, price=aligned_price, size=size,
+            side="buy", tick_size=tick_size, post_only=True,
+        )
+
+        if not resp:
+            # postOnly 실패 시 FAK로 전환
+            resp = self.poly.place_fak_order(
+                token_id=token_id, price=aligned_price + tick_size * 2,
+                size=size, side="buy", tick_size=tick_size,
             )
 
-    async def _shutdown(self):
+        if not resp:
+            log.warning("Entry order failed for %s", market.question[:40])
+            return
+
+        # 포지션 생성
+        position = Position(
+            market_id=market.condition_id,
+            market_question=market.question,
+            market_type=market_type,
+            strategy=strategy,
+            direction=direction,
+            token_id=token_id,
+            entry_price=aligned_price,
+            size=size,
+            bet_amount=bet_amount,
+            confluence_score=confluence_score,
+            boost_factor=boost_factor,
+            current_price=aligned_price,
+            peak_price=aligned_price,
+        )
+
+        if resp.get("orderID"):
+            position.tp_order_id = None
+
+        # 멀티 포지션 리스트에 추가
+        self.bot.add_position(position)
+
+        # 익절 오더 배치
+        tp_price = round(
+            round(position.tp_price / tick_size) * tick_size, 6)
+        tp_resp = self.poly.place_limit_order(
+            token_id=token_id, price=tp_price, size=size,
+            side="sell", tick_size=tick_size, post_only=False,
+        )
+        if tp_resp and tp_resp.get("orderID"):
+            position.tp_order_id = tp_resp["orderID"]
+
+        log.info(
+            "ENTRY [%d/%d]: %s %s @ %.4f, $%.2f, strategy=%s, confluence=%.1f",
+            self.bot.position_count(), config.MAX_CONCURRENT_POSITIONS,
+            direction, market.question[:40], aligned_price,
+            bet_amount, strategy, confluence_score,
+        )
+
+        await self.telegram.notify_entry(self.bot, position)
+
+    # ── 마켓 스캔 ──────────────────────────────────────────────
+
+    async def _refresh_markets(self):
+        """마켓 목록을 주기적으로 갱신."""
+        now = time.time()
+        if now - self._last_full_scan < config.FULL_RESCAN_INTERVAL:
+            return
+
+        self._markets = self.poly.fetch_crypto_markets()
+        self._last_full_scan = now
+
+        # XRP 필터
+        self._markets = [m for m in self._markets if not m.is_xrp]
+
+        with_tokens = sum(1 for m in self._markets if m.yes_token_id)
+        log.info("SCAN: %d markets total, %d with valid token IDs",
+                 len(self._markets), with_tokens)
+        if self._markets:
+            sample = self._markets[0]
+            log.info("SCAN sample: %s | yes_price=%.4f | vol24h=%.0f | "
+                     "yes_token=%s...",
+                     sample.question[:50], sample.yes_price,
+                     sample.volume_24h, sample.yes_token_id[:20])
+
+    # ── 일일 태스크 ────────────────────────────────────────────
+
+    async def _daily_tasks(self):
+        """매일 00:00 UTC에 리포트 + 백업."""
+        while self._running:
+            now = datetime.now(timezone.utc)
+            tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            if now.hour != 0 or now.minute != 0:
+                from datetime import timedelta
+                tomorrow += timedelta(days=1)
+            wait_sec = (tomorrow - now).total_seconds()
+            await asyncio.sleep(min(wait_sec, 3600))
+
+            if not self._running:
+                break
+
+            await self.telegram.send_daily_report(self.bot)
+            self.learning.backup_daily()
+            self.bot.reset_daily()
+
+    # ── 종료 ───────────────────────────────────────────────────
+
+    async def shutdown(self):
+        """봇 안전 종료."""
         log.info("Shutting down...")
-        self.trader._cooldown_until = self._cooldown_until
-        self.trader.save_state()
-        log.info("State saved to disk")
-        await self.collector.stop()
-        await self.trader.stop()
-        await self.notifier.stop()
+        self._running = False
+
+        if self.bot.has_position():
+            log.warning("Closing %d positions before shutdown",
+                        self.bot.position_count())
+            self.risk.close_all_positions(ExitReason.MANUAL)
+
+        self.poly.cancel_all()
+        self.feed.stop()
+        self.redeemer.stop()
         log.info("Shutdown complete")
 
     def stop(self):
