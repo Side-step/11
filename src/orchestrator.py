@@ -293,6 +293,8 @@ class ScalpingOrchestrator:
         if not self.bot.can_trade():
             return
 
+        logger.debug("EVAL: scanning %d markets for signals", len(self._markets))
+
         aw = self.learning.get_adaptive_weights()
         blend = self.learning.get_blend_ratio()
 
@@ -453,6 +455,9 @@ class ScalpingOrchestrator:
     ):
         """실제 주문을 제출하고 포지션을 생성합니다."""
         token_id = market.yes_token_id if direction == "Yes" else market.no_token_id
+        if not token_id:
+            logger.warning("No token ID for %s %s, skipping", direction, market.question[:40])
+            return
         tick_size = market.tick_size or 0.01
 
         # 진입 가격 결정
@@ -557,6 +562,17 @@ class ScalpingOrchestrator:
                 logger.debug("Filtered %d XRP markets", xrp_count)
                 self._markets = [m for m in self._markets if not m.is_xrp]
 
+            # 토큰 ID 상태 로그
+            with_tokens = sum(1 for m in self._markets if m.yes_token_id)
+            logger.info("SCAN: %d markets total, %d with valid token IDs",
+                        len(self._markets), with_tokens)
+            if self._markets:
+                sample = self._markets[0]
+                logger.info("SCAN sample: %s | yes_price=%.4f | vol24h=%.0f | "
+                            "yes_token=%s...",
+                            sample.question[:50], sample.yes_price,
+                            sample.volume_24h, sample.yes_token_id[:20])
+
     # ── 일일 태스크 ──────────────────────────────────────────
 
     async def _daily_tasks(self):
@@ -586,11 +602,7 @@ class ScalpingOrchestrator:
     # ── 유틸리티 ──────────────────────────────────────────────
 
     def _detect_asset(self, question: str) -> Optional[str]:
-        q = question.upper()
-        for asset in config.MONITORED_ASSETS:
-            if asset in q:
-                return asset
-        return None
+        return config.detect_asset(question)
 
     async def shutdown(self):
         """봇을 안전하게 종료합니다."""

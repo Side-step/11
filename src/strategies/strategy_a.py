@@ -93,6 +93,9 @@ def evaluate_strategy_a(
                 eval_dir = "buy"
                 token_id = market.no_token_id
 
+            if not token_id:
+                continue
+
             # 오더북 확인
             bids, asks = poly.get_orderbook(token_id)
             if not bids or not asks:
@@ -166,7 +169,6 @@ def _find_related_markets(
 ) -> list[MarketInfo]:
     """주어진 자산과 관련된 Polymarket 시장을 찾습니다."""
     related = []
-    symbol_lower = symbol.lower()
 
     for m in markets:
         if m.is_xrp or m.grade == "X":
@@ -176,8 +178,8 @@ def _find_related_markets(
         if not m.enable_order_book:
             continue
 
-        question_lower = m.question.lower()
-        if symbol_lower in question_lower or symbol in m.question:
+        detected = config.detect_asset(m.question)
+        if detected == symbol:
             # Type B 가격 조건 확인
             price = m.yes_price if direction == "up" else m.no_price
             if config.PRICE_MIN <= price <= config.PRICE_MAX:

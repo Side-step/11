@@ -150,35 +150,102 @@ class PolymarketClient:
     def _parse_market(self, raw: dict) -> Optional[MarketInfo]:
         """Gamma API 응답을 MarketInfo로 파싱."""
         try:
+            # 토큰 ID 파싱: Gamma API는 clobTokenIds + outcomes를 별도 필드로 반환
+            yes_token_id = ""
+            no_token_id = ""
+            yes_price = 0.0
+            no_price = 0.0
+
+            # 방법 1: tokens 배열 (일부 엔드포인트에서 제공)
             tokens = raw.get("tokens", [])
-            yes_token = next((t for t in tokens if t.get("outcome") == "Yes"), {})
-            no_token = next((t for t in tokens if t.get("outcome") == "No"), {})
+            if tokens and isinstance(tokens, list) and isinstance(tokens[0], dict):
+                yes_token = next((t for t in tokens if t.get("outcome") == "Yes"), {})
+                no_token = next((t for t in tokens if t.get("outcome") == "No"), {})
+                yes_token_id = yes_token.get("token_id", "")
+                no_token_id = no_token.get("token_id", "")
+                yes_price = float(yes_token.get("price", 0))
+                no_price = float(no_token.get("price", 0))
+
+            # 방법 2: clobTokenIds + outcomes (Gamma API 기본 형식)
+            if not yes_token_id:
+                import json as _json
+                clob_ids_raw = raw.get("clobTokenIds", "[]")
+                outcomes_raw = raw.get("outcomes", "[]")
+                prices_raw = raw.get("outcomePrices", "[]")
+
+                # JSON 문자열 또는 리스트 모두 처리
+                if isinstance(clob_ids_raw, str):
+                    clob_ids = _json.loads(clob_ids_raw)
+                else:
+                    clob_ids = clob_ids_raw or []
+
+                if isinstance(outcomes_raw, str):
+                    outcomes = _json.loads(outcomes_raw)
+                else:
+                    outcomes = outcomes_raw or []
+
+                if isinstance(prices_raw, str):
+                    prices = _json.loads(prices_raw)
+                else:
+                    prices = prices_raw or []
+
+                for i, outcome in enumerate(outcomes):
+                    tid = clob_ids[i] if i < len(clob_ids) else ""
+                    price = float(prices[i]) if i < len(prices) else 0.0
+                    if outcome == "Yes":
+                        yes_token_id = tid
+                        yes_price = price
+                    elif outcome == "No":
+                        no_token_id = tid
+                        no_price = price
+
+            if not yes_token_id and not no_token_id:
+                logger.debug("No token IDs found for market: %s",
+                             raw.get("question", "")[:60])
+                return None
+
+            # 태그 파싱
+            tags_raw = raw.get("tags", [])
+            if isinstance(tags_raw, str):
+                tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+            else:
+                tags = tags_raw or []
 
             mi = MarketInfo(
                 condition_id=raw.get("conditionId", raw.get("condition_id", "")),
                 question=raw.get("question", ""),
                 description=raw.get("description", ""),
-                tags=[t.strip() for t in raw.get("tags", "").split(",")]
-                     if isinstance(raw.get("tags"), str) else raw.get("tags", []),
-                tokens=tokens,
-                yes_token_id=yes_token.get("token_id", ""),
-                no_token_id=no_token.get("token_id", ""),
-                yes_price=float(yes_token.get("price", 0)),
-                no_price=float(no_token.get("price", 0)),
-                volume_24h=float(raw.get("volume24hr", raw.get("volume_num", 0) or 0)),
+                tags=tags,
+                tokens=tokens if isinstance(tokens, list) else [],
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
+                yes_price=yes_price,
+                no_price=no_price,
+                volume_24h=float(raw.get("volume24hr", 0) or 0),
                 active=raw.get("active", True),
                 closed=raw.get("closed", False),
                 end_date=raw.get("endDate", raw.get("end_date_iso", "")),
-                minimum_order_size=float(raw.get("minimum_order_size", 0)),
-                tick_size=float(raw.get("minimum_tick_size", 0.01)),
-                seconds_delay=int(raw.get("seconds_delay", 0)),
-                neg_risk=raw.get("neg_risk", False),
-                enable_order_book=raw.get("enable_order_book", True),
-                accepting_orders=raw.get("accepting_orders", True),
+                minimum_order_size=float(raw.get("minimumOrderSize",
+                                         raw.get("minimum_order_size", 0)) or 0),
+                tick_size=float(raw.get("orderPriceMinTickSize",
+                                raw.get("minimum_tick_size", 0.01)) or 0.01),
+                seconds_delay=int(raw.get("secondsDelay",
+                                  raw.get("seconds_delay", 0)) or 0),
+                neg_risk=raw.get("negRisk", raw.get("neg_risk", False)),
+                enable_order_book=raw.get("enableOrderBook",
+                                  raw.get("enable_order_book", True)),
+                accepting_orders=raw.get("acceptingOrders",
+                                 raw.get("accepting_orders", True)),
             )
+
+            if mi.yes_token_id:
+                logger.debug("Parsed market: %s | yes=%s... no=%s... | yes_p=%.4f",
+                             mi.question[:50], mi.yes_token_id[:16],
+                             mi.no_token_id[:16], mi.yes_price)
             return mi
         except Exception as e:
-            logger.debug("Failed to parse market: %s", e)
+            logger.error("Failed to parse market: %s (raw keys: %s)",
+                         e, list(raw.keys())[:10])
             return None
 
     # ── 오더북 / 가격 ────────────────────────────────────────

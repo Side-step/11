@@ -74,11 +74,13 @@ def evaluate_strategy_c(
         if not state:
             continue
 
-        # Yes 토큰 오더북 확인
+        # Yes/No 토큰 오더북 확인
         for side, token_id in [
             ("Yes", market.yes_token_id),
             ("No", market.no_token_id),
         ]:
+            if not token_id:
+                continue
             bids, asks = poly.get_orderbook(token_id)
             if not bids or not asks:
                 continue
@@ -153,8 +155,4 @@ def evaluate_strategy_c(
 
 def _detect_asset(question: str) -> Optional[str]:
     """시장 질문에서 관련 자산을 추출합니다."""
-    q = question.upper()
-    for asset in config.MONITORED_ASSETS:
-        if asset in q:
-            return asset
-    return None
+    return config.detect_asset(question)

@@ -53,6 +53,20 @@ BINANCE_WS = "wss://stream.binance.com:9443"
 MONITORED_ASSETS = ["BTC", "ETH", "SOL", "DOGE"]
 EXCLUDED_KEYWORDS = ["XRP", "xrp", "Ripple", "ripple", "\ub9ac\ud50c"]
 
+# Full name → symbol mapping for market question matching
+ASSET_NAME_MAP = {
+    "BITCOIN": "BTC",
+    "BTC": "BTC",
+    "ETHEREUM": "ETH",
+    "ETHER": "ETH",
+    "SOLANA": "SOL",
+    "SOL ": "SOL",     # space after to avoid false matches
+    "DOGECOIN": "DOGE",
+    "DOGE": "DOGE",
+}
+# Words that cause false ETH/SOL matches
+ASSET_FALSE_POSITIVES = ["NETHERLANDS", "SOLVED", "SOLUTION", "ETHANOL", "METHOD"]
+
 # ── Compound Betting ──────────────────────────────────────────
 BASE_BET_PCT = 0.10          # 10% of balance
 
@@ -92,8 +106,8 @@ NO_NEW_ENTRY_SEC = 840       # no new entry after 14:00
 FORCE_CLOSE_SEC = 870        # force close at 14:30
 
 # ── Market Selection (Type B) ────────────────────────────────
-PRICE_MIN = 0.20
-PRICE_MAX = 0.55
+PRICE_MIN = 0.05    # was 0.20, expanded to catch more markets
+PRICE_MAX = 0.95    # was 0.55, expanded to catch more markets
 MIN_DAILY_VOLUME = 30_000
 ORDERBOOK_DEPTH_MULTIPLIER = 3
 MAX_SPREAD_RATIO = 0.50      # spread <= target_move * 50%
@@ -111,11 +125,11 @@ SCAN_B_INTERVAL = 30
 FULL_RESCAN_INTERVAL = 300
 
 # ── Strategy A: Crypto Price Lag ──────────────────────────────
-PRICE_CHANGE_THRESHOLD = 0.01   # 1% in 1 minute
+PRICE_CHANGE_THRESHOLD = 0.003  # 0.3% in 1 minute (was 1%, too rare)
 POLYMARKET_LAG_SEC = 30
 
 # ── Strategy C: Orderbook Imbalance ──────────────────────────
-IMB_THRESHOLD = 0.4
+IMB_THRESHOLD = 0.25  # was 0.4, too strict
 STRATEGY_C_BET_MULTIPLIER = 0.7
 STRATEGY_C_MAX_HOLD = 600       # 10 minutes
 
@@ -134,9 +148,9 @@ CANDLE_15M_CONSERVATIVE_END = 780  # conservative entry 13:00
 CANDLE_15M_NO_ENTRY = 780       # no entry after 13:00
 
 # ── Confluence Scoring ────────────────────────────────────────
-CONFLUENCE_MIN_ENTRY = 5
-CONFLUENCE_HIGH = 7
-CONFLUENCE_HIGHEST = 9
+CONFLUENCE_MIN_ENTRY = 3        # was 5, lowered for realistic signal generation
+CONFLUENCE_HIGH = 5             # was 7
+CONFLUENCE_HIGHEST = 7          # was 9
 CONFLUENCE_BOOST_HIGH = 1.2
 CONFLUENCE_BOOST_HIGHEST = 1.5
 
@@ -204,6 +218,23 @@ WIN_RATE_NEUTRAL = 1.0
 WIN_RATE_PENALTY = 0.7
 WIN_RATE_STRONG_PENALTY = 0.4
 WIN_RATE_MIN_SAMPLES = 10
+
+def detect_asset(question: str):
+    """시장 질문에서 관련 크립토 자산 심볼을 추출합니다.
+
+    Returns: asset symbol (e.g. "BTC") or None
+    """
+    q = question.upper()
+    # 거짓 양성 확인
+    for fp in ASSET_FALSE_POSITIVES:
+        if fp in q:
+            q = q.replace(fp, "")
+    # 전체 이름으로 먼저 매칭 (긴 것부터)
+    for name in sorted(ASSET_NAME_MAP.keys(), key=len, reverse=True):
+        if name in q:
+            return ASSET_NAME_MAP[name]
+    return None
+
 
 # ── Logging ───────────────────────────────────────────────────
 TRADE_HISTORY_FILE = "data/trade_history.jsonl"

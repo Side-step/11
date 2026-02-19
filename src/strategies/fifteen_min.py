@@ -1,6 +1,6 @@
 """
-15분봉 시장 전용 전략.
-Polymarket의 15분 단위 가격 예측 시장에서 캔들 패턴 + 지표를 활용합니다.
+15분봉 추세 추종 전략.
+Binance 15분봉 캔들 패턴 + 지표를 활용하여 Polymarket 크립토 시장에 진입합니다.
 5분봉보다 긴 시간 프레임으로 더 안정적인 추세 확인이 가능합니다.
 """
 from __future__ import annotations
@@ -36,22 +36,19 @@ class FifteenMinSignal:
 
 
 def is_fifteen_min_market(market: MarketInfo) -> bool:
-    """15분봉 시장인지 판별합니다."""
-    q = market.question.lower()
-    indicators = [
-        "15 minute", "15-minute", "15min", "15분",
-        "quarter hour", "quarter-hour",
-    ]
-    return any(ind in q for ind in indicators)
+    """크립토 관련 시장인지 판별합니다 (모든 크립토 마켓 대상)."""
+    if not market.accepting_orders or not market.enable_order_book:
+        return False
+    if market.is_xrp or market.closed:
+        return False
+    if market.seconds_delay > 0:
+        return False
+    return config.detect_asset(market.question) is not None
 
 
 def get_candle_15m_elapsed(market: MarketInfo) -> float:
-    """
-    현재 15분 캔들의 경과 시간(초)을 추정합니다.
-    시장의 end_date와 현재 시간 기반으로 계산합니다.
-    """
+    """현재 15분 캔들의 경과 시간(초)을 추정합니다."""
     now = time.time()
-    # 15분 = 900초, 현재 시간을 900으로 나눈 나머지가 경과 시간
     return now % 900
 
 
@@ -65,36 +62,32 @@ def evaluate_fifteen_min(
     win_rate_factors: dict = None,
 ) -> Optional[FifteenMinSignal]:
     """
-    15분봉 시장 전략을 평가합니다.
+    15분봉 추세 추종 전략을 평가합니다.
 
     진입 조건:
-    1. 캔들 시작 후 5분 경과
+    1. 캔들 시작 후 5분 경과 (방향 확인)
     2. BTC/ETH 실시간 가격이 캔들 시작가 대비 방향 확인
-    3. 컨플루언스 점수 >= 5점
+    3. 컨플루언스 점수 >= 임계값
     4. 15분봉 RSI가 극단(25 이하 또는 75 이상) 아님
     5. 직전 3개 15분봉 추세 방향과 일치
     """
     if not bot.can_trade():
         return None
 
-    # 15분봉 시장 필터링
+    # 크립토 시장 필터링
     fifteen_min_markets = [m for m in markets if is_fifteen_min_market(m)]
     if not fifteen_min_markets:
+        logger.debug("15min: No eligible crypto markets found")
         return None
 
     for market in fifteen_min_markets:
-        if market.is_xrp or not market.accepting_orders:
-            continue
-        if market.seconds_delay > 0 or not market.enable_order_book:
+        # 동일 시장에 이미 포지션 있으면 스킵
+        if bot.has_market_position(market.condition_id):
             continue
 
         # 관련 자산 식별
         asset = _detect_asset_15min(market.question)
         if not asset:
-            continue
-
-        # 동일 시장에 이미 포지션 있으면 스킵
-        if bot.has_market_position(market.condition_id):
             continue
 
         state = feed.get_state(asset)
@@ -150,6 +143,8 @@ def evaluate_fifteen_min(
             market.yes_token_id if direction == "Yes"
             else market.no_token_id
         )
+        if not token_id:
+            continue
 
         # 오더북 확인
         bids, asks = poly.get_orderbook(token_id)
@@ -177,6 +172,8 @@ def evaluate_fifteen_min(
         # 보수적 진입 구간에서는 기준 상향
         min_score = config.CONFLUENCE_HIGH if conservative else config.CONFLUENCE_MIN_ENTRY
         if confluence.total < min_score:
+            logger.debug("15min: %s %s confluence %.1f < %.1f, skip",
+                         asset, market.question[:30], confluence.total, min_score)
             continue
 
         snapshot = build_snapshot(
@@ -210,8 +207,4 @@ def evaluate_fifteen_min(
 
 def _detect_asset_15min(question: str) -> Optional[str]:
     """15분봉 시장 질문에서 자산을 추출합니다."""
-    q = question.upper()
-    for asset in config.MONITORED_ASSETS:
-        if asset in q:
-            return asset
-    return None
+    return config.detect_asset(question)

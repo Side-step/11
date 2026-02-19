@@ -1,7 +1,7 @@
 """
-5분봉 시장 전용 전략.
-Polymarket의 5분 단위 가격 예측 시장에서 캔들 패턴 + 지표를 활용합니다.
-빠른 복리 회전 (시간당 최대 12건)이 핵심 장점입니다.
+5분봉 단기 추세 추종 전략.
+Binance 5분봉 캔들 패턴 + 지표를 활용하여 Polymarket 크립토 시장에 진입합니다.
+빠른 복리 회전이 핵심 장점입니다.
 """
 from __future__ import annotations
 
@@ -36,23 +36,19 @@ class FiveMinSignal:
 
 
 def is_five_min_market(market: MarketInfo) -> bool:
-    """5분봉 시장인지 판별합니다."""
-    q = market.question.lower()
-    indicators = [
-        "5 minute", "5-minute", "5min", "5분",
-        "candle close", "candle closing",
-        "next candle",
-    ]
-    return any(ind in q for ind in indicators)
+    """크립토 관련 시장인지 판별합니다 (모든 크립토 마켓 대상)."""
+    if not market.accepting_orders or not market.enable_order_book:
+        return False
+    if market.is_xrp or market.closed:
+        return False
+    if market.seconds_delay > 0:
+        return False
+    return config.detect_asset(market.question) is not None
 
 
 def get_candle_elapsed(market: MarketInfo) -> float:
-    """
-    현재 5분 캔들의 경과 시간(초)을 추정합니다.
-    시장의 end_date와 현재 시간 기반으로 계산합니다.
-    """
+    """현재 5분 캔들의 경과 시간(초)을 추정합니다."""
     now = time.time()
-    # 5분 = 300초, 현재 시간을 300으로 나눈 나머지가 경과 시간
     return now % 300
 
 
@@ -66,29 +62,25 @@ def evaluate_five_min(
     win_rate_factors: dict = None,
 ) -> Optional[FiveMinSignal]:
     """
-    5분봉 시장 전략을 평가합니다.
+    5분봉 추세 추종 전략을 평가합니다.
 
     진입 조건:
-    1. 캔들 시작 후 2분 경과
+    1. 캔들 시작 후 2분 경과 (방향 확인)
     2. BTC/ETH 실시간 가격이 캔들 시작가 대비 방향 확인
-    3. 컨플루언스 점수 ≥ 5점
+    3. 컨플루언스 점수 ≥ 임계값
     4. 1분봉 RSI가 극단(30 이하 또는 70 이상) 아님
     5. 직전 3개 5분봉 추세 방향과 일치
     """
     if not bot.can_trade():
         return None
 
-    # 5분봉 시장 필터링
+    # 크립토 시장 필터링
     five_min_markets = [m for m in markets if is_five_min_market(m)]
     if not five_min_markets:
+        logger.debug("5min: No eligible crypto markets found")
         return None
 
     for market in five_min_markets:
-        if market.is_xrp or not market.accepting_orders:
-            continue
-        if market.seconds_delay > 0 or not market.enable_order_book:
-            continue
-
         # 동일 시장에 이미 포지션 있으면 스킵
         if bot.has_market_position(market.condition_id):
             continue
@@ -137,7 +129,7 @@ def evaluate_five_min(
         else:
             continue
 
-        # 방향 결정
+        # 방향 결정: 추세 방향과 현재 캔들 방향이 일치해야 함
         if price_vs_open > 0 and trend_dir == "up":
             direction = "Yes"
             eval_dir = "buy"
@@ -151,6 +143,8 @@ def evaluate_five_min(
             market.yes_token_id if direction == "Yes"
             else market.no_token_id
         )
+        if not token_id:
+            continue
 
         # 오더북 확인
         bids, asks = poly.get_orderbook(token_id)
@@ -178,6 +172,8 @@ def evaluate_five_min(
         # 보수적 진입 구간에서는 기준 상향
         min_score = config.CONFLUENCE_HIGH if conservative else config.CONFLUENCE_MIN_ENTRY
         if confluence.total < min_score:
+            logger.debug("5min: %s %s confluence %.1f < %.1f, skip",
+                         asset, market.question[:30], confluence.total, min_score)
             continue
 
         snapshot = build_snapshot(
@@ -210,9 +206,5 @@ def evaluate_five_min(
 
 
 def _detect_asset_5min(question: str) -> Optional[str]:
-    """5분봉 시장 질문에서 자산을 추출합니다."""
-    q = question.upper()
-    for asset in config.MONITORED_ASSETS:
-        if asset in q:
-            return asset
-    return None
+    """시장 질문에서 자산을 추출합니다."""
+    return config.detect_asset(question)
