@@ -67,6 +67,10 @@ def evaluate_strategy_a(
             continue
 
         for market in related:
+            # 동일 시장에 이미 포지션 있으면 스킵
+            if bot.has_market_position(market.condition_id):
+                continue
+
             # Polymarket 가격 미반영 확인
             current_poly_price = poly.get_midpoint(
                 market.yes_token_id if spike["direction"] == "up" else market.no_token_id

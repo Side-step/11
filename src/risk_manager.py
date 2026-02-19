@@ -1,6 +1,7 @@
 """
 리스크 매니저: 비상 규칙, 자동 재시작, 포지션 관리, 슬리피지 모니터링.
 모든 비상 중단은 15분 쿨다운 후 자동 재시작합니다.
+멀티 포지션(최대 4개) 관리를 지원합니다.
 """
 from __future__ import annotations
 
@@ -72,7 +73,7 @@ class RiskManager:
         """
         비상 중단을 처리합니다.
         1. 미체결 주문 취소
-        2. 열린 포지션 시장가 청산
+        2. 모든 열린 포지션 시장가 청산
         3. 쿨다운 진입
         """
         logger.warning("EMERGENCY: %s", reason)
@@ -80,9 +81,9 @@ class RiskManager:
         # 미체결 주문 전량 취소
         self.poly.cancel_all()
 
-        # 열린 포지션 강제 청산
-        if self.bot.has_position():
-            self._force_close_position(ExitReason.EMERGENCY)
+        # 모든 열린 포지션 강제 청산
+        for pos in list(self.bot.positions):
+            self._force_close_position(pos, ExitReason.EMERGENCY)
 
         # 쿨다운 진입
         self.bot.enter_cooldown(reason)
@@ -161,18 +162,16 @@ class RiskManager:
             return abs(state.change_5m_pct) < config.RESTART_BTC_STABILITY
         return False
 
-    # ── 포지션 관리 ──────────────────────────────────────────
+    # ── 포지션 관리 (멀티 포지션) ──────────────────────────────
 
-    def manage_position(self) -> Optional[ExitReason]:
+    def manage_position(self, pos: Position) -> Optional[ExitReason]:
         """
-        열린 포지션의 15분 타임프레임을 관리합니다.
+        개별 포지션의 15분 타임프레임을 관리합니다.
         Returns: ExitReason if position should be closed, None otherwise
         """
-        pos = self.bot.position
         if not pos:
             return None
 
-        elapsed = pos.hold_time_sec
         phase = pos.get_phase()
 
         # 강제 청산 (14:30~15:00)
@@ -206,11 +205,10 @@ class RiskManager:
 
         return None
 
-    def execute_exit(self, reason: ExitReason):
+    def execute_exit(self, pos: Position, reason: ExitReason):
         """
-        포지션을 청산합니다.
+        특정 포지션을 청산합니다.
         """
-        pos = self.bot.position
         if not pos:
             return
 
@@ -240,11 +238,17 @@ class RiskManager:
         else:
             self.bot.record_loss(pos.pnl_usd)
 
-        self.bot.position = None
+        # 포지션 리스트에서 제거
+        self.bot.remove_position(pos)
 
-    def _force_close_position(self, reason: ExitReason):
-        """비상 시 강제 청산."""
-        self.execute_exit(reason)
+    def _force_close_position(self, pos: Position, reason: ExitReason):
+        """비상 시 특정 포지션 강제 청산."""
+        self.execute_exit(pos, reason)
+
+    def close_all_positions(self, reason: ExitReason):
+        """모든 포지션을 청산합니다."""
+        for pos in list(self.bot.positions):
+            self.execute_exit(pos, reason)
 
     # ── 슬리피지 모니터링 ────────────────────────────────────
 
@@ -278,14 +282,19 @@ class RiskManager:
         market_type: str,
         strategy: str,
         bet_amount: float,
+        market_id: str = "",
     ) -> tuple[bool, str]:
         """
         진입 전 최종 검증을 수행합니다.
         Returns: (allowed, reason)
         """
-        # 이미 포지션 보유 중
-        if self.bot.has_position():
-            return False, "Already has position"
+        # 최대 동시 포지션 수 초과
+        if not self.bot.can_open_more():
+            return False, f"Max positions ({config.MAX_CONCURRENT_POSITIONS}) reached"
+
+        # 동일 시장에 이미 포지션 존재
+        if market_id and self.bot.has_market_position(market_id):
+            return False, f"Already has position in market {market_id[:20]}"
 
         # 쿨다운 중
         if self.bot.is_in_cooldown():
@@ -299,9 +308,15 @@ class RiskManager:
         if self.bot.hwm_restricts_strategy() and strategy not in ("A",):
             return False, "HWM drawdown restricts to strategy A only"
 
+        # 총 노출 + 신규 베팅이 잔고 80% 초과
+        total_exposure = self.bot.total_exposure() + bet_amount
+        if total_exposure > self.bot.balance * 0.80:
+            return False, f"Total exposure ${total_exposure:.2f} > 80% of balance"
+
         # 잔고 확인
-        if bet_amount > self.bot.balance:
-            return False, f"Bet ${bet_amount:.2f} > balance ${self.bot.balance:.2f}"
+        available = self.bot.balance - self.bot.total_exposure()
+        if bet_amount > available:
+            return False, f"Bet ${bet_amount:.2f} > available ${available:.2f}"
 
         if bet_amount < 1.0:
             return False, f"Bet too small: ${bet_amount:.2f}"

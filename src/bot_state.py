@@ -132,8 +132,8 @@ class BotState:
         self.cooldown_until: float = 0.0
         self.cooldown_reason: str = ""
 
-        # Position
-        self.position: Optional[Position] = None
+        # Positions (최대 MAX_CONCURRENT_POSITIONS개 동시)
+        self.positions: list[Position] = []
 
         # Daily stats
         self.daily_trades: int = 0
@@ -318,16 +318,50 @@ class BotState:
     # ── Helpers ───────────────────────────────────────────────
 
     def has_position(self) -> bool:
-        return self.position is not None
+        """하나 이상의 포지션이 열려 있는지 확인합니다."""
+        return len(self.positions) > 0
+
+    def position_count(self) -> int:
+        """현재 열린 포지션 수를 반환합니다."""
+        return len(self.positions)
+
+    def can_open_more(self) -> bool:
+        """추가 포지션을 열 수 있는지 확인합니다."""
+        return len(self.positions) < config.MAX_CONCURRENT_POSITIONS
+
+    def has_market_position(self, market_id: str) -> bool:
+        """해당 시장에 이미 포지션이 있는지 확인합니다."""
+        return any(p.market_id == market_id for p in self.positions)
+
+    def add_position(self, pos: Position):
+        """포지션을 추가합니다."""
+        self.positions.append(pos)
+
+    def remove_position(self, pos: Position):
+        """포지션을 제거합니다."""
+        self.positions = [p for p in self.positions if p is not pos]
+
+    def total_exposure(self) -> float:
+        """전체 포지션의 합계 베팅 금액을 반환합니다."""
+        return sum(p.bet_amount for p in self.positions)
 
     def can_trade(self) -> bool:
+        """새로운 포지션 진입이 가능한지 확인합니다."""
         if self.phase not in (BotPhase.RUNNING,):
             return False
-        if self.has_position():
+        if not self.can_open_more():
             return False
         if self.balance < 1.0:
             return False
+        # 총 노출이 잔고의 80%를 넘으면 추가 진입 불가
+        if self.total_exposure() >= self.balance * 0.80:
+            return False
         return True
+
+    @property
+    def position(self) -> Optional[Position]:
+        """하위 호환: 첫 번째 포지션 반환."""
+        return self.positions[0] if self.positions else None
 
     def summary(self) -> dict:
         return {
@@ -343,4 +377,5 @@ class BotState:
             "daily_pnl": round(self.daily_pnl, 2),
             "phase": self.phase.value,
             "total_trades": self.total_trades,
+            "open_positions": self.position_count(),
         }

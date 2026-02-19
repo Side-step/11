@@ -2,8 +2,8 @@
 메인 봇 오케스트레이터.
 모든 모듈을 통합하여 10초 주기 트레이딩 루프를 실행합니다.
 
-의사결정 우선순위: 5분봉 > 전략A > 전략B > 전략C
-동시 포지션: 1개만
+의사결정 우선순위: 5분봉 > 15분봉 > 전략A > 전략B > 전략C
+동시 포지션: 최대 4개 (5분봉, 15분봉, 일반 전략 혼합 가능)
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from src.confluence import IndicatorSnapshot, build_snapshot, compute_confluence
 from src.polymarket_api import MarketInfo, PolymarketClient
 from src.risk_manager import RiskManager
 from src.strategies.five_min import FiveMinSignal, evaluate_five_min
+from src.strategies.fifteen_min import FifteenMinSignal, evaluate_fifteen_min
 from src.strategies.strategy_a import StrategyASignal, evaluate_strategy_a
 from src.strategies.strategy_b import StrategyBSignal, evaluate_strategy_b
 from src.strategies.strategy_c import StrategyCSignal, evaluate_strategy_c
@@ -65,7 +66,7 @@ class ScalpingOrchestrator:
         """
         logger.info("=" * 60)
         logger.info("Polymarket Compound Scalping Bot - BOOTING")
-        logger.info("Mode: %s", config.OPERATION_MODE)
+        logger.info("Mode: %s | Max Positions: %d", config.OPERATION_MODE, config.MAX_CONCURRENT_POSITIONS)
         logger.info("=" * 60)
 
         # STEP 1: Polymarket 클라이언트 초기화
@@ -87,7 +88,7 @@ class ScalpingOrchestrator:
 
         # STEP 4: Binance 과거 데이터 로드
         self.feed.load_historical()
-        logger.info("STEP 3: Binance historical data loaded")
+        logger.info("STEP 3: Binance historical data loaded (1m/5m/15m)")
 
         # STEP 5: 학습 엔진 초기화
         self.learning.initialize()
@@ -97,7 +98,7 @@ class ScalpingOrchestrator:
         self.redeemer.initialize()
 
         self.bot.phase = BotPhase.RUNNING
-        logger.info("BOOT COMPLETE - Trading loop starting")
+        logger.info("BOOT COMPLETE - Trading loop starting (max %d positions)", config.MAX_CONCURRENT_POSITIONS)
         return True
 
     # ── 메인 루프 ─────────────────────────────────────────────
@@ -155,69 +156,72 @@ class ScalpingOrchestrator:
             await self.telegram.notify_emergency(emergency, self.bot.balance, cooldown_until)
             return
 
-        # 3. 포지션 관리 (보유 중일 때)
-        if self.bot.has_position():
-            await self._manage_position()
+        # 3. 모든 열린 포지션 관리
+        await self._manage_all_positions()
+
+        # 4. 추가 포지션 진입 가능 여부 확인
+        if not self.bot.can_trade():
             return
 
-        # 4. 시장 스캔 (주기적)
+        # 5. 시장 스캔 (주기적)
         await self._refresh_markets()
 
-        # 5. 신호 평가 (우선순위: 5분봉 > A > B > C)
+        # 6. 신호 평가 (우선순위: 5분봉 > 15분봉 > A > B > C)
         await self._evaluate_signals()
 
-    # ── 포지션 관리 ──────────────────────────────────────────
+    # ── 멀티 포지션 관리 ──────────────────────────────────────
 
-    async def _manage_position(self):
-        """열린 포지션의 가격 업데이트 + 청산 판단."""
-        pos = self.bot.position
-        if not pos:
-            return
+    async def _manage_all_positions(self):
+        """모든 열린 포지션을 순회하며 관리합니다."""
+        for pos in list(self.bot.positions):
+            # 현재 가격 업데이트
+            price = self.poly.get_midpoint(pos.token_id)
+            if price > 0:
+                pos.current_price = price
 
-        # 현재 가격 업데이트
-        price = self.poly.get_midpoint(pos.token_id)
-        if price > 0:
-            pos.current_price = price
+            # 15분 타임프레임 관리
+            exit_reason = self.risk.manage_position(pos)
 
-        # 15분 타임프레임 관리
-        exit_reason = self.risk.manage_position()
+            # 지표 역전 체크
+            if not exit_reason:
+                exit_reason = self._check_indicator_reversal(pos)
 
-        # 지표 역전 체크
-        if not exit_reason:
-            asset_state = self.feed.get_state(
-                self._detect_asset(pos.market_question)
-            )
-            if asset_state:
-                reverse_dir = "sell" if pos.direction == "Yes" else "buy"
-                from src.indicators.orderbook import compute_ofi
-                bids, asks = self.poly.get_orderbook(pos.token_id)
-                ofi = compute_ofi(bids, asks) if bids and asks else None
+            if exit_reason:
+                await self._close_position(pos, exit_reason)
 
-                reverse_score = compute_confluence(
-                    direction=reverse_dir,
-                    rsi_1m=asset_state.rsi_1m,
-                    rsi_5m=asset_state.rsi_5m,
-                    ema=asset_state.ema,
-                    vwap=asset_state.vwap,
-                    bb=asset_state.bollinger,
-                    macd=asset_state.macd,
-                    volume=asset_state.volume_ratio,
-                    ofi=ofi,
-                )
-                if reverse_score.total >= 7:
-                    exit_reason = ExitReason.INDICATOR_REVERSAL
+    def _check_indicator_reversal(self, pos: Position) -> Optional[ExitReason]:
+        """지표 역전으로 인한 청산 필요 여부를 확인합니다."""
+        asset_state = self.feed.get_state(
+            self._detect_asset(pos.market_question)
+        )
+        if not asset_state:
+            return None
 
-        if exit_reason:
-            await self._close_position(exit_reason)
+        reverse_dir = "sell" if pos.direction == "Yes" else "buy"
+        from src.indicators.orderbook import compute_ofi
+        bids, asks = self.poly.get_orderbook(pos.token_id)
+        ofi = compute_ofi(bids, asks) if bids and asks else None
 
-    async def _close_position(self, reason: ExitReason):
+        reverse_score = compute_confluence(
+            direction=reverse_dir,
+            rsi_1m=asset_state.rsi_1m,
+            rsi_5m=asset_state.rsi_5m,
+            ema=asset_state.ema,
+            vwap=asset_state.vwap,
+            bb=asset_state.bollinger,
+            macd=asset_state.macd,
+            volume=asset_state.volume_ratio,
+            ofi=ofi,
+        )
+        if reverse_score.total >= 7:
+            return ExitReason.INDICATOR_REVERSAL
+
+        return None
+
+    async def _close_position(self, pos: Position, reason: ExitReason):
         """포지션을 청산하고 결과를 기록합니다."""
-        pos = self.bot.position
-        if not pos:
-            return
-
         old_pct = self.bot.current_bet_pct
-        self.risk.execute_exit(reason)
+        self.risk.execute_exit(pos, reason)
 
         # 학습 데이터 기록
         snapshot = {
@@ -227,12 +231,13 @@ class ScalpingOrchestrator:
             "strategy": pos.strategy,
             "asset": self._detect_asset(pos.market_question) or "BTC",
             "direction": pos.direction,
-            "indicators": {},  # snapshot was recorded at entry
+            "indicators": {},
             "context": {
                 "hour_utc": datetime.now(timezone.utc).hour,
                 "confluence_score": pos.confluence_score,
                 "streak": self.bot.consecutive_wins or -self.bot.consecutive_losses,
                 "hwm_drawdown": self.bot.hwm_drawdown_pct() * 100,
+                "open_positions": self.bot.position_count(),
             },
             "result": {
                 "outcome": "win" if pos.pnl_usd >= 0 else "loss",
@@ -257,7 +262,7 @@ class ScalpingOrchestrator:
     # ── 신호 평가 ─────────────────────────────────────────────
 
     async def _evaluate_signals(self):
-        """전략 우선순위에 따라 진입 신호를 평가합니다."""
+        """전략 우선순위에 따라 진입 신호를 평가합니다. 최대 4개 포지션까지 열기."""
         if not self.bot.can_trade():
             return
 
@@ -271,7 +276,18 @@ class ScalpingOrchestrator:
         )
         if five_min_signal:
             await self._execute_entry_5min(five_min_signal)
-            return
+            if not self.bot.can_trade():
+                return
+
+        # 15분봉 시장
+        fifteen_min_signal = evaluate_fifteen_min(
+            self.bot, self.feed, self.poly, self._markets,
+            adaptive_weights=aw, blend_ratio=blend,
+        )
+        if fifteen_min_signal:
+            await self._execute_entry_15min(fifteen_min_signal)
+            if not self.bot.can_trade():
+                return
 
         # 전략 A: 크립토 가격 연동
         signal_a = evaluate_strategy_a(
@@ -280,7 +296,8 @@ class ScalpingOrchestrator:
         )
         if signal_a:
             await self._execute_entry_a(signal_a)
-            return
+            if not self.bot.can_trade():
+                return
 
         # 전략 C: 오더북 불균형 (보조)
         if not self.bot.hwm_restricts_strategy():
@@ -290,7 +307,6 @@ class ScalpingOrchestrator:
             )
             if signal_c:
                 await self._execute_entry_c(signal_c)
-                return
 
     # ── 진입 실행 ─────────────────────────────────────────────
 
@@ -311,7 +327,10 @@ class ScalpingOrchestrator:
         bet_amount *= loss_mult * win_mult
 
         # 리스크 검증
-        ok, reason = self.risk.validate_entry("Type B", "A", bet_amount)
+        ok, reason = self.risk.validate_entry(
+            "Type B", "A", bet_amount,
+            market_id=signal.market.condition_id,
+        )
         if not ok:
             logger.debug("Entry blocked: %s", reason)
             return
@@ -332,7 +351,10 @@ class ScalpingOrchestrator:
         if bet_amount <= 0:
             return
 
-        ok, reason = self.risk.validate_entry("Type A", "5min", bet_amount)
+        ok, reason = self.risk.validate_entry(
+            "Type A", "5min", bet_amount,
+            market_id=signal.market.condition_id,
+        )
         if not ok:
             return
 
@@ -346,13 +368,39 @@ class ScalpingOrchestrator:
             boost_factor=signal.confluence.boost_factor,
         )
 
+    async def _execute_entry_15min(self, signal: FifteenMinSignal):
+        """15분봉 전략 진입 실행."""
+        bet_amount = self.bot.compute_bet_amount(boost=signal.confluence.boost_factor)
+        if bet_amount <= 0:
+            return
+
+        ok, reason = self.risk.validate_entry(
+            "Type A", "15min", bet_amount,
+            market_id=signal.market.condition_id,
+        )
+        if not ok:
+            return
+
+        await self._place_entry(
+            market=signal.market,
+            direction=signal.direction,
+            bet_amount=bet_amount,
+            strategy="15min",
+            market_type="Type A",
+            confluence_score=signal.confluence.total,
+            boost_factor=signal.confluence.boost_factor,
+        )
+
     async def _execute_entry_c(self, signal: StrategyCSignal):
         """전략 C 진입 실행 (보조, 베팅 축소)."""
         bet_amount = self.bot.compute_bet_amount() * config.STRATEGY_C_BET_MULTIPLIER
         if bet_amount <= 0:
             return
 
-        ok, reason = self.risk.validate_entry("Type B", "C", bet_amount)
+        ok, reason = self.risk.validate_entry(
+            "Type B", "C", bet_amount,
+            market_id=signal.market.condition_id,
+        )
         if not ok:
             return
 
@@ -437,7 +485,8 @@ class ScalpingOrchestrator:
         if resp.get("orderID"):
             position.tp_order_id = None  # 별도 익절 오더 배치
 
-        self.bot.position = position
+        # 멀티 포지션 리스트에 추가
+        self.bot.add_position(position)
 
         # 익절 오더 배치
         tp_price = round(
@@ -455,7 +504,8 @@ class ScalpingOrchestrator:
             position.tp_order_id = tp_resp["orderID"]
 
         logger.info(
-            "ENTRY: %s %s @ %.4f, $%.2f, strategy=%s, confluence=%.1f",
+            "ENTRY [%d/%d]: %s %s @ %.4f, $%.2f, strategy=%s, confluence=%.1f",
+            self.bot.position_count(), config.MAX_CONCURRENT_POSITIONS,
             direction, market.question[:40], aligned_price,
             bet_amount, strategy, confluence_score,
         )
@@ -521,8 +571,8 @@ class ScalpingOrchestrator:
         self._running = False
 
         if self.bot.has_position():
-            logger.warning("Closing position before shutdown")
-            self.risk.execute_exit(ExitReason.MANUAL)
+            logger.warning("Closing %d positions before shutdown", self.bot.position_count())
+            self.risk.close_all_positions(ExitReason.MANUAL)
 
         self.poly.cancel_all()
         self.feed.stop()

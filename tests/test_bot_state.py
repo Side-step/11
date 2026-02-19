@@ -1,6 +1,6 @@
 """봇 상태 + 복리 베팅 유닛 테스트."""
 import pytest
-from src.bot_state import BotState, BotPhase
+from src.bot_state import BotState, BotPhase, Position
 
 
 class TestCompoundBetting:
@@ -144,3 +144,94 @@ class TestDailyReset:
         assert bot.daily_trades == 0
         assert bot.daily_wins == 0
         assert bot.daily_pnl == 0.0
+
+
+def _make_pos(market_id="m1", strategy="A", bet_amount=20.0):
+    return Position(
+        market_id=market_id,
+        market_question="Will BTC reach 100k?",
+        market_type="Type B",
+        strategy=strategy,
+        direction="Yes",
+        token_id="tok1",
+        entry_price=0.50,
+        size=40.0,
+        bet_amount=bet_amount,
+        current_price=0.50,
+        peak_price=0.50,
+    )
+
+
+class TestMultiPosition:
+    def test_no_positions_default(self):
+        bot = BotState(initial_balance=200.0)
+        assert bot.position_count() == 0
+        assert not bot.has_position()
+        assert bot.can_open_more()
+
+    def test_add_positions(self):
+        bot = BotState(initial_balance=200.0)
+        bot.phase = BotPhase.RUNNING
+        bot.add_position(_make_pos("m1"))
+        assert bot.position_count() == 1
+        assert bot.has_position()
+        assert bot.has_market_position("m1")
+        assert not bot.has_market_position("m2")
+
+    def test_max_4_positions(self):
+        bot = BotState(initial_balance=1000.0)
+        bot.phase = BotPhase.RUNNING
+        for i in range(4):
+            bot.add_position(_make_pos(f"m{i}", bet_amount=20.0))
+        assert bot.position_count() == 4
+        assert not bot.can_open_more()
+
+    def test_remove_position(self):
+        bot = BotState(initial_balance=200.0)
+        pos1 = _make_pos("m1")
+        pos2 = _make_pos("m2")
+        bot.add_position(pos1)
+        bot.add_position(pos2)
+        assert bot.position_count() == 2
+
+        bot.remove_position(pos1)
+        assert bot.position_count() == 1
+        assert not bot.has_market_position("m1")
+        assert bot.has_market_position("m2")
+
+    def test_total_exposure(self):
+        bot = BotState(initial_balance=200.0)
+        bot.add_position(_make_pos("m1", bet_amount=20.0))
+        bot.add_position(_make_pos("m2", bet_amount=30.0))
+        assert bot.total_exposure() == 50.0
+
+    def test_can_trade_exposure_limit(self):
+        bot = BotState(initial_balance=100.0)
+        bot.phase = BotPhase.RUNNING
+        # 80% exposure limit
+        bot.add_position(_make_pos("m1", bet_amount=40.0))
+        bot.add_position(_make_pos("m2", bet_amount=40.0))
+        # total=80, which is 80% of 100 -> cannot trade
+        assert not bot.can_trade()
+
+    def test_can_trade_under_limit(self):
+        bot = BotState(initial_balance=200.0)
+        bot.phase = BotPhase.RUNNING
+        bot.add_position(_make_pos("m1", bet_amount=20.0))
+        # total=20, which is 10% of 200 -> can trade
+        assert bot.can_trade()
+
+    def test_position_compat_property(self):
+        bot = BotState(initial_balance=200.0)
+        assert bot.position is None
+
+        pos = _make_pos("m1")
+        bot.add_position(pos)
+        assert bot.position is pos
+
+    def test_summary_has_open_positions(self):
+        bot = BotState(initial_balance=200.0)
+        bot.add_position(_make_pos("m1"))
+        bot.add_position(_make_pos("m2"))
+        s = bot.summary()
+        assert s["open_positions"] == 2

@@ -61,6 +61,10 @@ def evaluate_strategy_c(
         if not market.accepting_orders or market.seconds_delay > 0:
             continue
 
+        # 동일 시장에 이미 포지션 있으면 스킵
+        if bot.has_market_position(market.condition_id):
+            continue
+
         # 관련 자산 판별
         asset = _detect_asset(market.question)
         if not asset:

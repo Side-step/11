@@ -41,6 +41,7 @@ class AssetState:
     # 캔들 저장소
     candles_1m: List[dict] = field(default_factory=list)
     candles_5m: List[dict] = field(default_factory=list)
+    candles_15m: List[dict] = field(default_factory=list)
 
     # 1분봉 지표 (1초마다 갱신)
     rsi_1m: Optional[RSIResult] = None
@@ -54,6 +55,13 @@ class AssetState:
     bollinger: Optional[BollingerResult] = None
     atr: Optional[ATRResult] = None
 
+    # 15분봉 지표 (15초마다 갱신)
+    rsi_15m: Optional[RSIResult] = None
+    bollinger_15m: Optional[BollingerResult] = None
+    atr_15m: Optional[ATRResult] = None
+    ema_15m: Optional[EMAResult] = None
+    change_15m_pct: float = 0.0
+
     last_update: float = 0.0
 
 
@@ -66,6 +74,7 @@ class BinanceFeed:
         self._running = False
         self._on_price_change: Optional[Callable] = None
         self._last_5m_update: Dict[str, float] = {}
+        self._last_15m_update: Dict[str, float] = {}
 
         # 모니터링 자산 초기화 (XRP 제외)
         for symbol in config.MONITORED_ASSETS:
@@ -86,16 +95,22 @@ class BinanceFeed:
                 candles_5m = self._fetch_klines(pair, "5m", 50)
                 state.candles_5m = candles_5m
 
+                # 15분봉 50개
+                candles_15m = self._fetch_klines(pair, "15m", 50)
+                state.candles_15m = candles_15m
+
                 if candles_1m:
                     state.price = candles_1m[-1]["close"]
 
                 # 초기 지표 계산
                 self._compute_1m_indicators(pair)
                 self._compute_5m_indicators(pair)
+                self._compute_15m_indicators(pair)
 
                 logger.info(
-                    "Loaded %s: %d 1m candles, %d 5m candles, price=%.2f",
-                    pair, len(candles_1m), len(candles_5m), state.price,
+                    "Loaded %s: %d 1m, %d 5m, %d 15m candles, price=%.2f",
+                    pair, len(candles_1m), len(candles_5m),
+                    len(candles_15m), state.price,
                 )
             except Exception as e:
                 logger.error("Failed to load %s: %s", pair, e)
@@ -134,6 +149,7 @@ class BinanceFeed:
             streams.extend([
                 f"{p}@kline_1m",
                 f"{p}@kline_5m",
+                f"{p}@kline_15m",
                 f"{p}@aggTrade",
             ])
 
@@ -220,6 +236,21 @@ class BinanceFeed:
                 self._compute_5m_indicators(pair)
                 self._last_5m_update[pair] = now
 
+        elif interval == "15m":
+            if is_closed:
+                state.candles_15m.append(candle)
+                state.candles_15m = state.candles_15m[-80:]
+            else:
+                if state.candles_15m:
+                    state.candles_15m[-1] = candle
+                else:
+                    state.candles_15m.append(candle)
+
+            now = time.time()
+            if now - self._last_15m_update.get(pair, 0) >= 15:
+                self._compute_15m_indicators(pair)
+                self._last_15m_update[pair] = now
+
     def _handle_trade(self, stream: str, data: dict):
         """체결 데이터로 최신 가격 업데이트."""
         pair = data.get("s", "").upper()
@@ -266,6 +297,24 @@ class BinanceFeed:
         state.rsi_5m = compute_rsi(candles, period=14)
         state.bollinger = compute_bollinger(candles, period=20, num_std=2.0)
         state.atr = compute_atr(candles, period=14)
+
+    def _compute_15m_indicators(self, pair: str):
+        """15분봉 기반 지표를 재계산합니다 (RSI, BB, ATR, EMA)."""
+        state = self.assets[pair]
+        candles = state.candles_15m
+        if len(candles) < 25:
+            return
+
+        state.rsi_15m = compute_rsi(candles, period=14)
+        state.bollinger_15m = compute_bollinger(candles, period=20, num_std=2.0)
+        state.atr_15m = compute_atr(candles, period=14)
+        state.ema_15m = compute_ema_cross(candles, fast=9, slow=21)
+
+        # 15분 변동률
+        if len(candles) >= 2:
+            prev = candles[-2]["close"]
+            if prev > 0:
+                state.change_15m_pct = (state.price - prev) / prev
 
     def _check_price_change(self, pair: str):
         """1분 내 1%+ 급변 감지 시 콜백 호출."""

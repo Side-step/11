@@ -78,7 +78,7 @@ class TelegramNotifier:
     async def notify_entry(self, bot: BotState, pos: Position):
         """포지션 진입 알림."""
         text = (
-            f"\U0001f7e2 <b>진입 완료</b>\n"
+            f"\U0001f7e2 <b>진입 완료</b> [{bot.position_count()}/{config.MAX_CONCURRENT_POSITIONS}]\n"
             f"시장: {_esc(pos.market_question)}\n"
             f"유형: {pos.market_type}\n"
             f"방향: {pos.direction} 매수\n"
@@ -87,7 +87,8 @@ class TelegramNotifier:
             f"목표 익절: {pos.tp_price:.4f}\n"
             f"손절 라인: {pos.sl_price:.4f}\n"
             f"전략: {pos.strategy}\n"
-            f"컨플루언스: {pos.confluence_score:.1f}점"
+            f"컨플루언스: {pos.confluence_score:.1f}점\n"
+            f"총 노출: ${bot.total_exposure():.2f}"
         )
         if pos.boost_factor > 1.0:
             text += f" (부스트 x{pos.boost_factor:.1f})"
@@ -139,6 +140,7 @@ class TelegramNotifier:
             f"\U0001f4b0 현재 잔고: ${bot.balance:.2f}\n"
             f"\U0001f4ca 오늘 성적: {bot.daily_wins}승 {bot.daily_losses}패 "
             f"({'+' if bot.daily_pnl >= 0 else ''}${bot.daily_pnl:.2f})\n"
+            f"\U0001f4c8 열린 포지션: {bot.position_count()}/{config.MAX_CONCURRENT_POSITIONS}\n"
             f"{streak_info}"
         )
         await self.send(text, "P2")
@@ -284,7 +286,8 @@ class TelegramNotifier:
                 f"베팅 비율: {s['bet_pct']}%\n"
                 f"연승: {s['consecutive_wins']} / 연패: {s['consecutive_losses']}\n"
                 f"상태: {s['phase']}\n"
-                f"DD: {s['drawdown_pct']}%"
+                f"DD: {s['drawdown_pct']}%\n"
+                f"열린 포지션: {s['open_positions']}/{config.MAX_CONCURRENT_POSITIONS}"
             )
         elif cmd == "/today":
             return (

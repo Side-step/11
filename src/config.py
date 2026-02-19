@@ -72,6 +72,7 @@ LOSS_STREAK_BET_TABLE = {
     8: None,   # cooldown
 }
 MAX_BET_PCT = 0.25
+MAX_CONCURRENT_POSITIONS = 4        # 최대 동시 포지션 수
 COOLDOWN_MINUTES = 15
 COOLDOWN_RESTART_PCT = 0.05
 
@@ -124,6 +125,13 @@ CANDLE_5M_ENTRY_START = 120     # entry window 2:00
 CANDLE_5M_ENTRY_END = 210       # entry window ends 3:30
 CANDLE_5M_CONSERVATIVE_END = 270  # conservative entry 4:30
 CANDLE_5M_NO_ENTRY = 270        # no entry after 4:30
+
+# ── 15-Minute Candle Markets ─────────────────────────────────
+CANDLE_15M_OBSERVE_SEC = 300    # observe first 5 min
+CANDLE_15M_ENTRY_START = 300    # entry window 5:00
+CANDLE_15M_ENTRY_END = 660      # entry window ends 11:00
+CANDLE_15M_CONSERVATIVE_END = 780  # conservative entry 13:00
+CANDLE_15M_NO_ENTRY = 780       # no entry after 13:00
 
 # ── Confluence Scoring ────────────────────────────────────────
 CONFLUENCE_MIN_ENTRY = 5
