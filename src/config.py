@@ -14,6 +14,13 @@ BUILDER_KEY = os.getenv("BUILDER_KEY", "")
 BUILDER_SECRET = os.getenv("BUILDER_SECRET", "")
 BUILDER_PASSPHRASE = os.getenv("BUILDER_PASSPHRASE", "")
 POLYGON_RPC_URL = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+# Fallback RPCs if primary fails (public, no API key needed)
+POLYGON_RPC_FALLBACKS = [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://rpc.ankr.com/polygon",
+    "https://polygon.llamarpc.com",
+    "https://polygon.drpc.org",
+]
 POLY_API_KEY = os.getenv("POLY_API_KEY", "")
 POLY_API_SECRET = os.getenv("POLY_API_SECRET", "")
 POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
@@ -62,10 +69,14 @@ ASSET_NAME_MAP = {
     "SOLANA": "SOL",
     "SOL ": "SOL",     # space after to avoid false matches
     "DOGECOIN": "DOGE",
-    "DOGE": "DOGE",
+    # Note: bare "DOGE" removed — too ambiguous with "Department of Government Efficiency"
 }
-# Words that cause false ETH/SOL matches
-ASSET_FALSE_POSITIVES = ["NETHERLANDS", "SOLVED", "SOLUTION", "ETHANOL", "METHOD"]
+# Words that cause false ETH/SOL/DOGE matches
+ASSET_FALSE_POSITIVES = [
+    "NETHERLANDS", "SOLVED", "SOLUTION", "ETHANOL", "METHOD",
+    "GOVERNMENT EFFICIENCY",  # DOGE = Department of Government Efficiency
+    "DEPARTMENT OF",           # further DOGE government disambiguation
+]
 
 # ── Compound Betting ──────────────────────────────────────────
 BASE_BET_PCT = 0.10          # 10% of balance

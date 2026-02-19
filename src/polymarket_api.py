@@ -112,26 +112,65 @@ class PolymarketClient:
     # ── 시장 조회 (Gamma API) ────────────────────────────────
 
     def fetch_crypto_markets(self) -> List[MarketInfo]:
-        """Gamma API에서 크립토 태그 시장 목록을 조회합니다."""
-        markets = []
-        try:
-            resp = requests.get(
-                f"{config.GAMMA_API}/markets",
-                params={"tag": "crypto", "active": "true", "closed": "false"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        """
+        Gamma API에서 활성 시장을 볼륨 순으로 가져온 후,
+        클라이언트 측에서 크립토 가격 예측 시장을 필터링합니다.
 
-            for m in data:
-                mi = self._parse_market(m)
-                if mi and not mi.is_xrp:
-                    markets.append(mi)
+        tag=crypto는 잘못된 결과를 반환하므로 사용하지 않습니다.
+        대신 전체 시장을 볼륨 순으로 가져와 detect_asset()으로 필터링합니다.
+        """
+        all_markets: List[MarketInfo] = []
+        crypto_markets: List[MarketInfo] = []
 
-        except Exception as e:
-            logger.error("Gamma API fetch failed: %s", e)
+        # 페이지네이션으로 충분한 시장 수집 (볼륨 순)
+        for offset in range(0, 600, 100):
+            try:
+                resp = requests.get(
+                    f"{config.GAMMA_API}/markets",
+                    params={
+                        "active": "true",
+                        "closed": "false",
+                        "order": "volume24hr",
+                        "ascending": "false",
+                        "limit": 100,
+                        "offset": offset,
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+                if not batch:
+                    break  # 더 이상 결과 없음
 
-        return markets
+                for m in batch:
+                    mi = self._parse_market(m)
+                    if mi and not mi.is_xrp:
+                        all_markets.append(mi)
+
+                if len(batch) < 100:
+                    break  # 마지막 페이지
+
+            except Exception as e:
+                logger.error("Gamma API fetch failed (offset=%d): %s", offset, e)
+                break
+
+        # 클라이언트 측 크립토 필터링
+        for mi in all_markets:
+            asset = config.detect_asset(mi.question)
+            if asset:
+                crypto_markets.append(mi)
+
+        logger.info(
+            "Market discovery: %d total active -> %d crypto markets (assets: %s)",
+            len(all_markets),
+            len(crypto_markets),
+            ", ".join(sorted(set(
+                config.detect_asset(m.question) or "?"
+                for m in crypto_markets
+            ))),
+        )
+
+        return crypto_markets
 
     def fetch_events(self, tag: str = "crypto") -> List[dict]:
         """이벤트 목록을 조회합니다."""
@@ -651,26 +690,31 @@ class PolymarketClient:
         return self._rpc_call_balance(contract, call_data, label)
 
     def _rpc_call_balance(self, contract: str, call_data: str, label: str) -> float:
-        """Polygon RPC eth_call 실행 후 USDC 잔고 반환."""
-        try:
-            resp = requests.post(
-                config.POLYGON_RPC_URL,
-                json={
-                    "jsonrpc": "2.0",
-                    "method": "eth_call",
-                    "params": [{"to": contract, "data": call_data}, "latest"],
-                    "id": 1,
-                },
-                timeout=10,
-            )
-            result = resp.json().get("result", "0x0")
-            balance = int(result, 16) / 1e6  # USDC = 6 decimals
-            if balance > 0:
-                logger.info("Balance (%s): $%.2f", label, balance)
-            return balance
-        except Exception as e:
-            logger.info("RPC balance query failed (%s): %s", label, e)
-            return 0.0
+        """Polygon RPC eth_call 실행 후 USDC 잔고 반환. 여러 RPC 폴백 시도."""
+        rpc_urls = [config.POLYGON_RPC_URL] + getattr(config, "POLYGON_RPC_FALLBACKS", [])
+
+        for rpc_url in rpc_urls:
+            try:
+                resp = requests.post(
+                    rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "eth_call",
+                        "params": [{"to": contract, "data": call_data}, "latest"],
+                        "id": 1,
+                    },
+                    timeout=10,
+                )
+                result = resp.json().get("result", "0x0")
+                if result and result != "0x":
+                    balance = int(result, 16) / 1e6  # USDC = 6 decimals
+                    if balance > 0:
+                        logger.info("Balance (%s): $%.2f via %s", label, balance, rpc_url)
+                    return balance
+            except Exception as e:
+                logger.debug("RPC balance query failed (%s via %s): %s", label, rpc_url, e)
+
+        return 0.0
 
     def get_positions(self) -> List[dict]:
         """보유 포지션 목록을 조회합니다."""

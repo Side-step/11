@@ -34,15 +34,34 @@ class AutoRedeemer:
     def initialize(self) -> bool:
         """
         Web3 + Relay 클라이언트를 초기화합니다.
+        여러 Polygon RPC를 시도하여 연결합니다.
         Builder Relayer가 설정되어 있으면 가스리스 실행,
         아니면 EOA 직접 실행 (가스비 필요).
         """
         try:
             from web3 import Web3
-            self._w3 = Web3(Web3.HTTPProvider(config.POLYGON_RPC_URL))
 
-            if not self._w3.is_connected():
-                logger.warning("Web3 not connected to Polygon")
+            # 기본 RPC + 폴백 RPC 모두 시도
+            rpc_urls = [config.POLYGON_RPC_URL] + getattr(config, "POLYGON_RPC_FALLBACKS", [])
+
+            for rpc_url in rpc_urls:
+                try:
+                    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+                    if w3.is_connected():
+                        self._w3 = w3
+                        logger.info("AutoRedeemer: Connected to Polygon via %s", rpc_url)
+                        break
+                    else:
+                        logger.debug("RPC not connected: %s", rpc_url)
+                except Exception as e:
+                    logger.debug("RPC connection failed (%s): %s", rpc_url, e)
+
+            if self._w3 is None or not self._w3.is_connected():
+                logger.warning(
+                    "Web3 not connected to Polygon (tried %d RPCs). "
+                    "Auto-redeem disabled. Set POLYGON_RPC_URL to a working endpoint.",
+                    len(rpc_urls),
+                )
                 return False
 
             # Builder Relayer 사용 가능 여부 확인
