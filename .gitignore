@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+data/trade_history.jsonl
+data/backups/
+data/learning_state.json
+data/adaptive_weights.json
+data/patterns.json
+*.log
+.venv/
+venv/
