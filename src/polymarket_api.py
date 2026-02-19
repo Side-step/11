@@ -251,22 +251,36 @@ class PolymarketClient:
     # ── 오더북 / 가격 ────────────────────────────────────────
 
     def get_orderbook(self, token_id: str) -> tuple[List[OrderbookLevel], List[OrderbookLevel]]:
-        """토큰의 오더북을 조회합니다. (bids, asks) 반환."""
+        """
+        토큰의 오더북을 조회합니다. (bids, asks) 반환.
+
+        공식 API: GET /book?token_id=...
+        응답: OrderBookSummary 객체
+          - bids: [OrderSummary(price="0.45", size="100"), ...]
+          - asks: [OrderSummary(price="0.46", size="150"), ...]
+          price/size는 문자열(str)
+        """
         if not self._initialized:
             return [], []
         try:
             book = self._clob_client.get_order_book(token_id)
+
+            # book은 OrderBookSummary 객체 (속성 접근)
+            raw_bids = book.bids if hasattr(book, "bids") else book.get("bids", [])
+            raw_asks = book.asks if hasattr(book, "asks") else book.get("asks", [])
+
             bids = []
-            for b in (book.bids or []):
-                # OrderSummary 객체 또는 dict 모두 지원
-                p = float(b.price if hasattr(b, "price") else b["price"])
-                s = float(b.size if hasattr(b, "size") else b["size"])
+            for b in (raw_bids or []):
+                # OrderSummary 객체: .price, .size (문자열)
+                p = float(getattr(b, "price", None) or b.get("price", 0) if isinstance(b, dict) else b.price)
+                s = float(getattr(b, "size", None) or b.get("size", 0) if isinstance(b, dict) else b.size)
                 bids.append(OrderbookLevel(price=p, size=s))
             asks = []
-            for a in (book.asks or []):
-                p = float(a.price if hasattr(a, "price") else a["price"])
-                s = float(a.size if hasattr(a, "size") else a["size"])
+            for a in (raw_asks or []):
+                p = float(getattr(a, "price", None) or a.get("price", 0) if isinstance(a, dict) else a.price)
+                s = float(getattr(a, "size", None) or a.get("size", 0) if isinstance(a, dict) else a.size)
                 asks.append(OrderbookLevel(price=p, size=s))
+
             # 정렬: bids 내림차순, asks 오름차순
             bids.sort(key=lambda x: -x.price)
             asks.sort(key=lambda x: x.price)
@@ -275,28 +289,56 @@ class PolymarketClient:
             logger.error("Orderbook fetch failed for %s: %s", token_id, e)
             return [], []
 
+    @staticmethod
+    def _extract_float(result, *keys) -> float:
+        """API 반환값에서 float을 추출합니다. dict/객체/스칼라 모두 지원."""
+        if result is None:
+            return 0.0
+        if isinstance(result, (int, float)):
+            return float(result)
+        if isinstance(result, str):
+            return float(result) if result else 0.0
+        # dict인 경우 여러 키 시도
+        if isinstance(result, dict):
+            for k in keys:
+                if k in result:
+                    return float(result[k])
+            return 0.0
+        # 객체인 경우 속성으로 시도
+        for k in keys:
+            val = getattr(result, k, None)
+            if val is not None:
+                return float(val)
+        return 0.0
+
     def get_price(self, token_id: str, side: str = "buy") -> float:
-        """현재 가격을 조회합니다."""
+        """
+        현재 가격을 조회합니다.
+
+        공식 API: GET /price?token_id=...&side=BUY
+        응답: {"price": 0.45}
+        """
         if not self._initialized:
             return 0.0
         try:
             result = self._clob_client.get_price(token_id, side)
-            # dict {"price": "0.45"} 또는 float/str 모두 처리
-            if isinstance(result, dict):
-                return float(result.get("price", 0))
-            return float(result)
+            return self._extract_float(result, "price")
         except Exception as e:
             logger.error("Price fetch failed: %s", e)
             return 0.0
 
     def get_midpoint(self, token_id: str) -> float:
+        """
+        미드포인트 가격을 조회합니다.
+
+        공식 API: GET /midpoint?token_id=...
+        응답: {"mid_price": "0.45"}  (문자열!)
+        """
         if not self._initialized:
             return 0.0
         try:
             result = self._clob_client.get_midpoint(token_id)
-            if isinstance(result, dict):
-                return float(result.get("mid", result.get("price", 0)))
-            return float(result)
+            return self._extract_float(result, "mid_price", "mid", "price")
         except Exception as e:
             logger.error("Midpoint fetch failed: %s", e)
             return 0.0
@@ -305,7 +347,9 @@ class PolymarketClient:
         if not self._initialized:
             return 0.01
         try:
-            return float(self._clob_client.get_tick_size(condition_id))
+            result = self._clob_client.get_tick_size(condition_id)
+            val = self._extract_float(result, "minimum_tick_size", "tick_size")
+            return val if val > 0 else 0.01
         except Exception as e:
             logger.debug("Tick size fetch failed: %s", e)
             return 0.01
@@ -326,6 +370,32 @@ class PolymarketClient:
 
     # ── 주문 실행 ─────────────────────────────────────────────
 
+    def _get_market_options(self, token_id: str, tick_size: float = 0.01):
+        """마켓 옵션(tickSize, negRisk)을 조회합니다. 공식 문서 필수 파라미터."""
+        neg_risk = self.is_neg_risk(token_id)
+        # tick_size를 문자열로 변환 (공식 문서: "0.1", "0.01", "0.001", "0.0001")
+        ts_str = str(tick_size)
+        return {"tick_size": ts_str, "neg_risk": neg_risk}
+
+    def _parse_order_resp(self, resp, label: str) -> Optional[Dict[str, Any]]:
+        """주문 응답을 파싱합니다."""
+        if resp is None:
+            return None
+        # dict 또는 객체 모두 처리
+        if isinstance(resp, dict):
+            d = resp
+        else:
+            d = {
+                "orderID": getattr(resp, "orderID", getattr(resp, "order_id", "")),
+                "status": getattr(resp, "status", ""),
+                "errorMsg": getattr(resp, "errorMsg", getattr(resp, "error_msg", "")),
+            }
+        err = d.get("errorMsg", "")
+        if err:
+            logger.error("%s rejected: %s", label, err)
+            return None
+        return d
+
     def place_limit_order(
         self,
         token_id: str,
@@ -337,6 +407,8 @@ class PolymarketClient:
     ) -> Optional[Dict[str, Any]]:
         """
         GTC 리밋 오더를 제출합니다.
+
+        공식 문서: createAndPostOrder({tokenID, price, size, side}, {tickSize, negRisk}, GTC)
         메이커 수수료 0%를 위해 기본적으로 postOnly=true.
         """
         if not self._initialized:
@@ -360,16 +432,15 @@ class PolymarketClient:
             resp = self._clob_client.post_order(
                 signed,
                 order_type=OrderType.GTC,
-                postOnly=post_only,
             )
-            if resp.get("errorMsg"):
-                logger.error("Order rejected: %s", resp["errorMsg"])
-                return None
-            logger.info(
-                "LIMIT %s %s: price=%.4f size=%.2f -> %s",
-                side, token_id[:12], price, size, resp.get("orderID"),
-            )
-            return resp
+            result = self._parse_order_resp(resp, "LIMIT")
+            if result:
+                logger.info(
+                    "LIMIT %s %s: price=%.4f size=%.2f -> %s (status=%s)",
+                    side, token_id[:16], price, size,
+                    result.get("orderID", "?"), result.get("status", "?"),
+                )
+            return result
         except Exception as e:
             logger.error("Limit order failed: %s", e)
             return None
@@ -384,7 +455,9 @@ class PolymarketClient:
     ) -> Optional[Dict[str, Any]]:
         """
         FAK (Fill-And-Kill) 주문: 즉시 체결 가능한 만큼 체결, 나머지 취소.
-        손절/시간청산에 적합.
+
+        공식 문서: create_order → post_order(signed, OrderType.FAK)
+        price는 worst-price limit (슬리피지 보호).
         """
         if not self._initialized:
             return None
@@ -404,14 +477,14 @@ class PolymarketClient:
             signed = self._clob_client.create_order(order_args)
             resp = self._clob_client.post_order(signed, order_type=OrderType.FAK)
 
-            if resp.get("errorMsg"):
-                logger.error("FAK order rejected: %s", resp["errorMsg"])
-                return None
-            logger.info(
-                "FAK %s %s: price=%.4f size=%.2f -> %s",
-                side, token_id[:12], price, size, resp.get("orderID"),
-            )
-            return resp
+            result = self._parse_order_resp(resp, "FAK")
+            if result:
+                logger.info(
+                    "FAK %s %s: price=%.4f size=%.2f -> %s (status=%s)",
+                    side, token_id[:16], price, size,
+                    result.get("orderID", "?"), result.get("status", "?"),
+                )
+            return result
         except Exception as e:
             logger.error("FAK order failed: %s", e)
             return None
