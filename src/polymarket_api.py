@@ -256,14 +256,17 @@ class PolymarketClient:
             return [], []
         try:
             book = self._clob_client.get_order_book(token_id)
-            bids = [
-                OrderbookLevel(price=float(b["price"]), size=float(b["size"]))
-                for b in (book.bids or [])
-            ]
-            asks = [
-                OrderbookLevel(price=float(a["price"]), size=float(a["size"]))
-                for a in (book.asks or [])
-            ]
+            bids = []
+            for b in (book.bids or []):
+                # OrderSummary 객체 또는 dict 모두 지원
+                p = float(b.price if hasattr(b, "price") else b["price"])
+                s = float(b.size if hasattr(b, "size") else b["size"])
+                bids.append(OrderbookLevel(price=p, size=s))
+            asks = []
+            for a in (book.asks or []):
+                p = float(a.price if hasattr(a, "price") else a["price"])
+                s = float(a.size if hasattr(a, "size") else a["size"])
+                asks.append(OrderbookLevel(price=p, size=s))
             # 정렬: bids 내림차순, asks 오름차순
             bids.sort(key=lambda x: -x.price)
             asks.sort(key=lambda x: x.price)
