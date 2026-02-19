@@ -272,6 +272,86 @@ class TelegramNotifier:
         )
         await self.send(text, "P4")
 
+    # ── 부팅 알림 ─────────────────────────────────────────────
+
+    async def notify_boot(self, bot: BotState):
+        """봇 부팅 완료 알림."""
+        text = (
+            f"\U0001f680 <b>봇 부팅 완료</b>\n\n"
+            f"잔고: ${bot.balance:.2f}\n"
+            f"모드: {config.OPERATION_MODE}\n"
+            f"최대 포지션: {config.MAX_CONCURRENT_POSITIONS}개\n"
+            f"베팅 비율: {bot.current_bet_pct*100:.0f}%\n\n"
+            f"명령어: /status /today /config"
+        )
+        await self.send(text, "P1")
+
+    # ── 텔레그램 명령어 수신 (Long Polling) ─────────────────
+
+    async def start_polling(self, bot: BotState):
+        """텔레그램 getUpdates 롱 폴링으로 명령어를 수신합니다."""
+        if not self._enabled:
+            logger.info("Telegram polling disabled (no token/chat_id)")
+            return
+
+        offset = 0
+        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+        logger.info("Telegram polling started")
+
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    params = {"offset": offset, "timeout": 30, "allowed_updates": ["message"]}
+                    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=40)) as resp:
+                        if resp.status != 200:
+                            await asyncio.sleep(5)
+                            continue
+                        data = await resp.json()
+
+                if not data.get("ok"):
+                    await asyncio.sleep(5)
+                    continue
+
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    msg = update.get("message", {})
+                    text = msg.get("text", "")
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                    # 허가된 채팅에서만 명령 처리
+                    if chat_id != self.chat_id:
+                        continue
+
+                    if text.startswith("/"):
+                        reply = await self.handle_command(text, bot)
+                        await self._reply(chat_id, reply)
+
+            except asyncio.CancelledError:
+                logger.info("Telegram polling stopped")
+                return
+            except Exception as e:
+                logger.debug("Telegram polling error: %s", e)
+                await asyncio.sleep(5)
+
+    async def _reply(self, chat_id: str, text: str):
+        """특정 채팅에 답장을 전송합니다."""
+        if not self._enabled:
+            return
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        logger.debug("Telegram reply failed: %d", resp.status)
+        except Exception as e:
+            logger.debug("Telegram reply error: %s", e)
+
     # ── 텔레그램 명령어 처리 ──────────────────────────────────
 
     async def handle_command(self, command: str, bot: BotState) -> str:
@@ -305,8 +385,17 @@ class TelegramNotifier:
                 f"상태: {bot.phase.value}\n"
                 f"총 거래: {bot.total_trades}"
             )
+        elif cmd == "/help":
+            return (
+                "사용 가능한 명령어:\n"
+                "/status - 봇 상태 확인\n"
+                "/today - 오늘 성적\n"
+                "/config - 설정 확인\n"
+                "/pause - 봇 일시정지\n"
+                "/resume - 봇 재시작"
+            )
         else:
-            return "알 수 없는 명령어"
+            return "알 수 없는 명령어. /help로 목록 확인."
 
 
 def _esc(text: str) -> str:

@@ -76,11 +76,21 @@ class ScalpingOrchestrator:
 
         # STEP 2: 잔고 확인
         balance = self.poly.get_balance()
-        initial = float(os.environ.get("INITIAL_CAPITAL", 0)) or balance or 200.0
+        env_capital = float(os.environ.get("INITIAL_CAPITAL", 0))
+        if env_capital > 0:
+            initial = env_capital
+        elif balance > 0:
+            initial = balance
+        else:
+            logger.warning("Balance query returned $0 — using $200 default. "
+                           "Check PROXY_WALLET_ADDRESS and network connectivity.")
+            initial = 200.0
         self.bot = BotState(initial_balance=initial)
         self.risk = RiskManager(self.bot, self.feed, self.poly)
         self.telegram = TelegramNotifier()
-        logger.info("STEP 1: Balance = $%.2f", self.bot.balance)
+        logger.info("STEP 1: Balance = $%.2f (source: %s)",
+                     self.bot.balance,
+                     "env" if env_capital > 0 else ("api" if balance > 0 else "default"))
 
         # STEP 3: 시장 스캔
         self._markets = self.poly.fetch_crypto_markets()
@@ -99,6 +109,10 @@ class ScalpingOrchestrator:
 
         self.bot.phase = BotPhase.RUNNING
         logger.info("BOOT COMPLETE - Trading loop starting (max %d positions)", config.MAX_CONCURRENT_POSITIONS)
+
+        # 부팅 알림 전송
+        await self.telegram.notify_boot(self.bot)
+
         return True
 
     # ── 메인 루프 ─────────────────────────────────────────────
@@ -116,6 +130,7 @@ class ScalpingOrchestrator:
             asyncio.create_task(self.redeemer.start_loop()),
             asyncio.create_task(self._trading_loop()),
             asyncio.create_task(self._daily_tasks()),
+            asyncio.create_task(self.telegram.start_polling(self.bot)),
         ]
 
         try:

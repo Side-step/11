@@ -374,19 +374,64 @@ class PolymarketClient:
     # ── 잔고 / 포지션 ────────────────────────────────────────
 
     def get_balance(self) -> float:
-        """USDC 잔고를 조회합니다."""
-        try:
-            resp = requests.get(
-                f"{config.DATA_API}/positions",
-                headers=self._auth_headers(),
-                timeout=10,
-            )
-            # 대안: CLOB API의 balance 엔드포인트 사용
-            # 실제 구현에서는 on-chain 또는 CLOB API 사용
+        """USDC 잔고를 조회합니다 (CLOB API → on-chain 순서로 시도)."""
+        # 방법 1: py-clob-client의 balance-allowance API
+        if self._initialized:
+            try:
+                result = self._clob_client.get_balance_allowance()
+                if result:
+                    if isinstance(result, dict):
+                        raw = result.get("balance", 0)
+                    else:
+                        raw = getattr(result, "balance", 0)
+                    bal = float(raw)
+                    # USDC 6 decimals: raw 단위가 매우 크면 변환
+                    usdc = bal / 1e6 if bal > 100_000 else bal
+                    if usdc > 0:
+                        logger.info("Balance (CLOB API): $%.2f", usdc)
+                        return usdc
+            except Exception as e:
+                logger.debug("CLOB balance-allowance failed: %s", e)
+
+        # 방법 2: Polygon RPC로 프록시 지갑의 on-chain USDC 잔고 조회
+        bal = self._query_onchain_usdc()
+        if bal > 0:
+            return bal
+
+        logger.warning("All balance methods returned 0")
+        return 0.0
+
+    def _query_onchain_usdc(self) -> float:
+        """Polygon RPC를 통해 프록시 지갑의 USDC 잔고를 조회합니다."""
+        proxy = config.PROXY_WALLET_ADDRESS
+        if not proxy:
             return 0.0
-        except Exception as e:
-            logger.debug("Balance fetch: %s", e)
-            return 0.0
+
+        # ERC20 balanceOf(address) selector = 0x70a08231
+        addr_hex = proxy.lower().replace("0x", "").zfill(64)
+        call_data = f"0x70a08231{addr_hex}"
+
+        for usdc_addr in [config.USDC_NATIVE, config.USDC_ADDRESS]:
+            try:
+                resp = requests.post(
+                    config.POLYGON_RPC_URL,
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "eth_call",
+                        "params": [{"to": usdc_addr, "data": call_data}, "latest"],
+                        "id": 1,
+                    },
+                    timeout=10,
+                )
+                result = resp.json().get("result", "0x0")
+                balance = int(result, 16) / 1e6  # USDC = 6 decimals
+                if balance > 0:
+                    logger.info("Balance (on-chain %s): $%.2f", usdc_addr[:10], balance)
+                    return balance
+            except Exception as e:
+                logger.debug("On-chain USDC query failed (%s): %s", usdc_addr[:10], e)
+
+        return 0.0
 
     def get_positions(self) -> List[dict]:
         """보유 포지션 목록을 조회합니다."""
