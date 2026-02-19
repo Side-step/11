@@ -280,7 +280,11 @@ class PolymarketClient:
         if not self._initialized:
             return 0.0
         try:
-            return float(self._clob_client.get_price(token_id, side))
+            result = self._clob_client.get_price(token_id, side)
+            # dict {"price": "0.45"} 또는 float/str 모두 처리
+            if isinstance(result, dict):
+                return float(result.get("price", 0))
+            return float(result)
         except Exception as e:
             logger.error("Price fetch failed: %s", e)
             return 0.0
@@ -289,7 +293,10 @@ class PolymarketClient:
         if not self._initialized:
             return 0.0
         try:
-            return float(self._clob_client.get_midpoint(token_id))
+            result = self._clob_client.get_midpoint(token_id)
+            if isinstance(result, dict):
+                return float(result.get("mid", result.get("price", 0)))
+            return float(result)
         except Exception as e:
             logger.error("Midpoint fetch failed: %s", e)
             return 0.0
