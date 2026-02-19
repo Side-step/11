@@ -25,10 +25,12 @@ def setup_logging():
             logging.FileHandler("bot.log", mode="a"),
         ],
     )
-    # 외부 라이브러리 로그 레벨 조정
+    # 외부 라이브러리 로그 레벨 조정 (HTTP 요청 로그 숨김)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 async def main():
