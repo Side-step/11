@@ -468,10 +468,7 @@ class PolymarketClient:
                 token_id=token_id,
             )
             signed = self._clob_client.create_order(order_args)
-            resp = self._clob_client.post_order(
-                signed,
-                order_type=OrderType.GTC,
-            )
+            resp = self._clob_client.post_order(signed, OrderType.GTC)
             result = self._parse_order_resp(resp, "LIMIT")
             if result:
                 logger.info(
@@ -514,7 +511,7 @@ class PolymarketClient:
                 token_id=token_id,
             )
             signed = self._clob_client.create_order(order_args)
-            resp = self._clob_client.post_order(signed, order_type=OrderType.FAK)
+            resp = self._clob_client.post_order(signed, OrderType.FAK)
 
             result = self._parse_order_resp(resp, "FAK")
             if result:
