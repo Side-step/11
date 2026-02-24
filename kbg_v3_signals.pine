@@ -95,9 +95,20 @@ exit_rsi_ob      = input.int(70, minval=50, maxval=95, title="RSI Overbought", g
 exit_rsi_os      = input.int(30, minval=5,  maxval=50, title="RSI Oversold",   group="TP Reverse")
 exit_min_score   = input.int(2, minval=1, maxval=3, title="Min Signals (1-3)", group="TP Reverse")
 
-// ─── 횡보 필터 (Whipsaw Filter) ──────────────────────────────────────────────
-adx_len          = input.int(14, minval=1, title="ADX Length",             group="Whipsaw Filter")
-adx_threshold    = input.int(20, minval=5, maxval=50, title="ADX 최소값 (추세 강도)", group="Whipsaw Filter")
+// ─── 횡보 필터 (Bollinger Band Width) ────────────────────────────────────────
+// BB 폭이 평균보다 넓으면 = 변동성 있음 = 추세 → 시그널 허용
+// BB 폭이 평균보다 좁으면 = 스퀴즈 = 횡보 → 시그널 차단
+bbw_len     = input.int(20, minval=5, title="BB Length",               group="Whipsaw Filter")
+bbw_avg_len = input.int(50, minval=10, title="BB Width 평균 기간",     group="Whipsaw Filter")
+bbw_mult    = input.float(1.0, minval=0.1, step=0.1, title="BB Width 배수 (낮을수록 민감)", group="Whipsaw Filter")
+
+bb_basis = ta.sma(close, bbw_len)
+bb_dev   = 2.0 * ta.stdev(close, bbw_len)
+bb_upper = bb_basis + bb_dev
+bb_lower = bb_basis - bb_dev
+bbw      = (bb_upper - bb_lower) / bb_basis * 100  // BB 폭 (%)
+bbw_avg  = ta.sma(bbw, bbw_avg_len)                // BB 폭 이동평균
+not_squeeze = bbw > bbw_avg * bbw_mult              // 스퀴즈 아님 = 시그널 허용
 
 // ① Pivot High / Low 감지
 ph = ta.pivothigh(high, exit_pivot_left, exit_pivot_right)
@@ -115,16 +126,6 @@ hma_val = hullma(hma_src, hma_base_length + hma_length_scalar * 6)
 hma_slope_down = hma_val[1] < hma_val[2]
 hma_slope_up   = hma_val[1] > hma_val[2]
 
-// ADX 계산 (추세 강도 판별)
-dmp = ta.rma(math.max(ta.change(high), 0), adx_len)
-dmm = ta.rma(math.max(-ta.change(low), 0), adx_len)
-adx_tr = ta.rma(ta.tr(true), adx_len)
-di_plus  = 100 * dmp / adx_tr
-di_minus = 100 * dmm / adx_tr
-dx = 100 * math.abs(di_plus - di_minus) / (di_plus + di_minus)
-adx_val = ta.rma(dx, adx_len)
-adx_ok = adx_val > adx_threshold  // ADX 높음 = 추세 있음 → 시그널 허용
-
 // 포지션 추적 (TP 반전 기반)
 var int position = 0     // 1=롱, -1=숏, 0=없음
 var int last_signal = 0  // 마지막 시그널 방향: 1=롱, -1=숏
@@ -133,9 +134,9 @@ var int last_signal = 0  // 마지막 시그널 방향: 1=롱, -1=숏
 exit_long_score  = (found_pivot_high ? 1 : 0) + (rsi_overbought ? 1 : 0) + (hma_slope_down ? 1 : 0)
 exit_short_score = (found_pivot_low  ? 1 : 0) + (rsi_oversold   ? 1 : 0) + (hma_slope_up   ? 1 : 0)
 
-// TP 반전 시그널: 스코어 충족 + 교대 + ADX 필터
-rev_to_short = exit_long_score  >= exit_min_score and last_signal != -1 and adx_ok and barstate.isconfirmed
-rev_to_long  = exit_short_score >= exit_min_score and last_signal !=  1 and adx_ok and barstate.isconfirmed
+// TP 반전 시그널: 스코어 충족 + 교대 + BB 스퀴즈 아닐 때만
+rev_to_short = exit_long_score  >= exit_min_score and last_signal != -1 and not_squeeze and barstate.isconfirmed
+rev_to_long  = exit_short_score >= exit_min_score and last_signal !=  1 and not_squeeze and barstate.isconfirmed
 
 // 포지션 & 시그널 기록 갱신
 if rev_to_short
