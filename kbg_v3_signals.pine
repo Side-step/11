@@ -76,17 +76,27 @@ scolor  = tr_up ? color.green : tr_down ? color.red : color.blue
 bgcolor(scolor)
 
 // ─── 색상 변화 시그널 (Color Change Signals) ─────────────────────────────────
-// 트렌드 상태를 숫자로 변환: 1=Green(Long), -1=Red(Short), 0=Blue(Close)
-trend_state = tr_up ? 1 : tr_down ? -1 : 0
-prev_state  = tr_up[1] ? 1 : tr_down[1] ? -1 : 0
+// 리페인트 방지: 확정 봉(barstate.isconfirmed)의 값만 사용
+// 현재 봉이 닫히기 전에는 close가 계속 변하므로 시그널이 깜빡일 수 있음
+// → 확정된 이전 봉 기준([1])으로 비교하여 봉 마감 시에만 시그널 확정
 
-// 색상이 변할 때만 시그널 발생
-color_changed = trend_state != prev_state
+// 확정된 봉 기준 트렌드 상태 (이전 봉 = 확정 완료)
+// [1] = 직전 확정 봉, [2] = 그 이전 확정 봉
+confirmed_tr_up_1   = ma1[1] > upper2[1]
+confirmed_tr_down_1 = ma1[1] < lower2[1]
+confirmed_tr_up_2   = ma1[2] > upper2[2]
+confirmed_tr_down_2 = ma1[2] < lower2[2]
 
-// 시그널 조건
-signal_long  = color_changed and trend_state ==  1  // 초록색으로 변경 → 롱
-signal_short = color_changed and trend_state == -1  // 빨간색으로 변경 → 숏
-signal_close = color_changed and trend_state ==  0  // 파란색으로 변경 → 클로즈
+confirmed_state = confirmed_tr_up_1 ? 1 : confirmed_tr_down_1 ? -1 : 0
+prev_confirmed  = confirmed_tr_up_2 ? 1 : confirmed_tr_down_2 ? -1 : 0
+
+// 확정 봉 기준 색상 변화 감지
+confirmed_changed = confirmed_state != prev_confirmed
+
+// 시그널 조건 (봉 마감 기준, 리페인트 없음)
+signal_long  = confirmed_changed and confirmed_state ==  1  // 초록색으로 변경 → 롱
+signal_short = confirmed_changed and confirmed_state == -1  // 빨간색으로 변경 → 숏
+signal_close = confirmed_changed and confirmed_state ==  0  // 파란색으로 변경 → 클로즈
 
 // 시그널 표시
 plotshape(signal_long,  title="Long Signal",  text="LONG",  style=shape.labelup,
