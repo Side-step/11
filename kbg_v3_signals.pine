@@ -75,98 +75,70 @@ tr_down = ma1 < lower2
 scolor  = tr_up ? color.green : tr_down ? color.red : color.blue
 bgcolor(scolor)
 
-// ─── 색상 변화 시그널 (Color Change Signals) ─────────────────────────────────
-// 리페인트 방지: barstate.isconfirmed 사용
-// - 과거 봉: 이미 확정 → 지연 없이 정확한 봉에 시그널 표시
-// - 실시간 봉: 봉 마감(close 확정) 순간에만 시그널 발생 (깜빡임 없음)
-
-// 현재 봉 트렌드 상태
+// ─── 트렌드 상태 (포지션 추적용, 시그널 표시 없음) ───────────────────────────
 trend_state = tr_up ? 1 : tr_down ? -1 : 0
-// 이전 봉 트렌드 상태 (이미 확정됨)
 prev_state  = tr_up[1] ? 1 : tr_down[1] ? -1 : 0
-
-// 색상 변화 감지
 color_changed = trend_state != prev_state
+trend_to_long  = color_changed and trend_state ==  1 and barstate.isconfirmed
+trend_to_short = color_changed and trend_state == -1 and barstate.isconfirmed
+trend_to_neutral = color_changed and trend_state == 0 and barstate.isconfirmed
 
-// barstate.isconfirmed: 봉이 마감된 최종 틱에서만 true
-// 과거 데이터에서는 항상 true → 지연 없음
-// 실시간에서는 봉 마감 시에만 true → 리페인트 없음
-signal_long  = color_changed and trend_state ==  1 and barstate.isconfirmed
-signal_short = color_changed and trend_state == -1 and barstate.isconfirmed
-signal_close = color_changed and trend_state ==  0 and barstate.isconfirmed
-
-// 시그널 표시
-plotshape(signal_long,  title="Long Signal",  text="LONG",  style=shape.labelup,
-     location=location.belowbar, color=color.green, textcolor=color.white, size=size.normal)
-plotshape(signal_short, title="Short Signal", text="SHORT", style=shape.labeldown,
-     location=location.abovebar, color=color.red,   textcolor=color.white, size=size.normal)
-plotshape(signal_close, title="Close Signal", text="CLOSE", style=shape.diamond,
-     location=location.abovebar, color=color.blue,  textcolor=color.white, size=size.normal)
-
-// 시그널 알림 (Alerts)
-alertcondition(signal_long,  title="Long Signal",  message="KBGv3: LONG - 초록색 전환")
-alertcondition(signal_short, title="Short Signal", message="KBGv3: SHORT - 빨간색 전환")
-alertcondition(signal_close, title="Close Signal", message="KBGv3: CLOSE - 파란색 전환")
-
-// ─── 고점/저점 청산 시그널 (Swing Exit Signals) ──────────────────────────────
+// ─── TP 반전 시그널 (Swing Reverse Signals) ─────────────────────────────────
+// 고점 감지 → 롱 청산 + 숏 진입 / 저점 감지 → 숏 청산 + 롱 진입
 // 3가지 조합: ① Pivot High/Low ② RSI 과매수/과매도 ③ HMA 기울기 반전
-// 2개 이상 충족 시 청산 시그널 발생
 
 // Settings
-exit_pivot_left  = input.int(3, minval=1, title="Exit Pivot Left Bars",  group="Exit Signal")
-exit_pivot_right = input.int(3, minval=1, title="Exit Pivot Right Bars", group="Exit Signal")
-exit_rsi_len     = input.int(14, minval=1, title="Exit RSI Length",      group="Exit Signal")
-exit_rsi_ob      = input.int(70, minval=50, maxval=95, title="RSI Overbought", group="Exit Signal")
-exit_rsi_os      = input.int(30, minval=5,  maxval=50, title="RSI Oversold",   group="Exit Signal")
-exit_min_score   = input.int(2, minval=1, maxval=3, title="Min Signals (1-3)", group="Exit Signal")
+exit_pivot_left  = input.int(3, minval=1, title="Pivot Left Bars",  group="TP Reverse")
+exit_pivot_right = input.int(3, minval=1, title="Pivot Right Bars", group="TP Reverse")
+exit_rsi_len     = input.int(14, minval=1, title="RSI Length",      group="TP Reverse")
+exit_rsi_ob      = input.int(70, minval=50, maxval=95, title="RSI Overbought", group="TP Reverse")
+exit_rsi_os      = input.int(30, minval=5,  maxval=50, title="RSI Oversold",   group="TP Reverse")
+exit_min_score   = input.int(2, minval=1, maxval=3, title="Min Signals (1-3)", group="TP Reverse")
 
 // ① Pivot High / Low 감지
 ph = ta.pivothigh(high, exit_pivot_left, exit_pivot_right)
 pl = ta.pivotlow(low,   exit_pivot_left, exit_pivot_right)
-// pivot은 exit_pivot_right 봉 전에 발생 → 이미 확정된 값 (리페인트 없음)
 found_pivot_high = not na(ph)
 found_pivot_low  = not na(pl)
 
-// ② RSI 과매수/과매도
+// ② RSI 과매수/과매도 (확정 봉 기준)
 exit_rsi = ta.rsi(close, exit_rsi_len)
-// 확정 봉 기준: [1]로 계산 (현재 봉 RSI는 변동 가능)
-rsi_overbought = exit_rsi[1] > exit_rsi_ob   // 롱 청산 조건
-rsi_oversold   = exit_rsi[1] < exit_rsi_os   // 숏 청산 조건
+rsi_overbought = exit_rsi[1] > exit_rsi_ob
+rsi_oversold   = exit_rsi[1] < exit_rsi_os
 
-// ③ HMA 기울기 반전 (이미 계산된 hullma 활용)
+// ③ HMA 기울기 반전
 hma_val = hullma(hma_src, hma_base_length + hma_length_scalar * 6)
-// 확정 봉 기준: [1] vs [2]
-hma_slope_down = hma_val[1] < hma_val[2]  // HMA 하락 전환 → 롱 청산
-hma_slope_up   = hma_val[1] > hma_val[2]  // HMA 상승 전환 → 숏 청산
+hma_slope_down = hma_val[1] < hma_val[2]
+hma_slope_up   = hma_val[1] > hma_val[2]
 
-// 포지션 추적 (색상 기반)
+// 포지션 추적
 var int position = 0  // 1=롱, -1=숏, 0=없음
-if signal_long
+if trend_to_long
     position := 1
-if signal_short
+if trend_to_short
     position := -1
-if signal_close
+if trend_to_neutral
     position := 0
 
-// 청산 스코어 계산
+// 스코어 계산
 exit_long_score  = (found_pivot_high ? 1 : 0) + (rsi_overbought ? 1 : 0) + (hma_slope_down ? 1 : 0)
 exit_short_score = (found_pivot_low  ? 1 : 0) + (rsi_oversold   ? 1 : 0) + (hma_slope_up   ? 1 : 0)
 
-// 청산 시그널: 포지션 보유 중 + 최소 스코어 충족 + 봉 확정
-exit_long  = position ==  1 and exit_long_score  >= exit_min_score and barstate.isconfirmed
-exit_short = position == -1 and exit_short_score >= exit_min_score and barstate.isconfirmed
+// TP 반전 시그널: 롱 보유 중 고점 감지 → 숏 전환 / 숏 보유 중 저점 감지 → 롱 전환
+rev_to_short = position ==  1 and exit_long_score  >= exit_min_score and barstate.isconfirmed
+rev_to_long  = position == -1 and exit_short_score >= exit_min_score and barstate.isconfirmed
 
-// 청산 후 포지션 리셋
-if exit_long
-    position := 0
-if exit_short
-    position := 0
+// 포지션 반전
+if rev_to_short
+    position := -1
+if rev_to_long
+    position := 1
 
-// 청산 시그널 표시
-plotshape(exit_long, title="Exit Long", text="TP\nLONG", style=shape.xcross,
-     location=location.abovebar, color=color.orange, textcolor=color.orange, size=size.small)
-plotshape(exit_short, title="Exit Short", text="TP\nSHORT", style=shape.xcross,
-     location=location.belowbar, color=color.orange, textcolor=color.orange, size=size.small)
+// 시그널 표시
+plotshape(rev_to_short, title="TP → Short", text="SHORT", style=shape.labeldown,
+     location=location.abovebar, color=color.red, textcolor=color.white, size=size.normal)
+plotshape(rev_to_long, title="TP → Long", text="LONG", style=shape.labelup,
+     location=location.belowbar, color=color.green, textcolor=color.white, size=size.normal)
 
 // Pivot 레벨 표시 (참고용)
 plot(found_pivot_high ? ph : na, title="Pivot High", style=plot.style_cross,
@@ -174,6 +146,6 @@ plot(found_pivot_high ? ph : na, title="Pivot High", style=plot.style_cross,
 plot(found_pivot_low ? pl : na, title="Pivot Low", style=plot.style_cross,
      color=color.new(color.green, 30), linewidth=2, offset=-exit_pivot_right)
 
-// 청산 알림
-alertcondition(exit_long,  title="Exit Long",  message="KBGv3: EXIT LONG - 고점 청산")
-alertcondition(exit_short, title="Exit Short", message="KBGv3: EXIT SHORT - 저점 청산")
+// 알림
+alertcondition(rev_to_short, title="TP → Short", message="KBGv3: TP REVERSE → SHORT (고점 반전)")
+alertcondition(rev_to_long,  title="TP → Long",  message="KBGv3: TP REVERSE → LONG (저점 반전)")
