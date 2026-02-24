@@ -165,9 +165,9 @@ if rev_to_long
     last_signal :=  1
 
 // 시그널 표시
-plotshape(rev_to_short, title="TP → Short", text="SHORT", style=shape.labeldown,
+plotshape(rev_to_short, title="TP → Short", text="TP", style=shape.labeldown,
      location=location.abovebar, color=color.red, textcolor=color.white, size=size.normal)
-plotshape(rev_to_long, title="TP → Long", text="LONG", style=shape.labelup,
+plotshape(rev_to_long, title="TP → Long", text="TP", style=shape.labelup,
      location=location.belowbar, color=color.green, textcolor=color.white, size=size.normal)
 
 // Pivot 레벨 표시 (참고용)
