@@ -85,8 +85,8 @@ trend_to_neutral = color_changed and trend_state == 0 and barstate.isconfirmed
 
 // (진입 시그널 표시는 포지션 상태 머신 뒤에서 처리)
 
-// ─── TP 반전 시그널 (Swing Reverse Signals) ─────────────────────────────────
-// 고점 감지 → 롱 청산 + 숏 진입 / 저점 감지 → 숏 청산 + 롱 진입
+// ─── TP 시그널 (Swing Exit) ──────────────────────────────────────────────────
+// 고점 감지 → 롱 청산 / 저점 감지 → 숏 청산 (플랫으로 전환)
 // 3가지 조합: ① Pivot High/Low ② RSI 과매수/과매도 ③ HMA 기울기 반전
 
 // Settings
@@ -112,6 +112,14 @@ bbw      = (bb_upper - bb_lower) / bb_basis * 100  // BB 폭 (%)
 bbw_avg  = ta.sma(bbw, bbw_avg_len)                // BB 폭 이동평균
 not_squeeze = bbw > bbw_avg * bbw_mult              // 스퀴즈 아님 = 시그널 허용
 
+// ─── 추세 강도 필터 (ADX) ──────────────────────────────────────────────────
+// ADX > 임계값 = 강한 추세 → 진입 허용
+// ADX < 임계값 = 횡보/약세 → 진입 차단 (잦은 거래 원천 방지)
+adx_len       = input.int(14, minval=5, maxval=50, title="ADX Length",               group="Trend Strength")
+adx_threshold = input.float(20.0, minval=5, maxval=50, step=1, title="ADX 임계값 (높을수록 엄격)", group="Trend Strength")
+[diplus, diminus, adx_val] = ta.dmi(adx_len, adx_len)
+strong_trend = adx_val > adx_threshold
+
 // ① Pivot High / Low 감지
 ph = ta.pivothigh(high, exit_pivot_left, exit_pivot_right)
 pl = ta.pivotlow(low,   exit_pivot_left, exit_pivot_right)
@@ -128,49 +136,51 @@ hma_val = hullma(hma_src, hma_base_length + hma_length_scalar * 6)
 hma_slope_down = hma_val[1] < hma_val[2]
 hma_slope_up   = hma_val[1] > hma_val[2]
 
-// ─── 포지션 상태 머신 ──────────────────────────────────────────────────────
+// ─── 포지션 상태 머신 (ADX 기반) ─────────────────────────────────────────
 // position: 0=플랫, 1=롱, -1=숏
-// 핵심: 직접 LONG↔SHORT 전환 금지!
-//   진입 → TP 또는 CL(청산) → 쿨다운 대기 → 재진입
-//   횡보 구간 색상 왕복 = CL 후 쿨다운으로 재진입 차단 → 휩소 방지
+// 핵심: ADX로 추세 강도 확인 → 횡보 구간 진입 원천 차단
+//   강한 추세에서만 진입 → CL 또는 TP로 청산 → 다음 ADX 확인 후 재진입
 var int position = 0
-var int exit_bar = -999          // 마지막 청산 bar_index
-var bool awaiting_entry = true   // 재진입 대기 플래그
+var bool awaiting_entry = true
+var bool saw_color_change = true   // 초기: 첫 시그널 허용
 
-cooldown_bars = input.int(5, minval=0, maxval=20, title="CL → 재진입 쿨다운 (봉 수)", group="Entry Filter")
-passed_cooldown = bar_index - exit_bar >= cooldown_bars
+// 색상 변화 추적 (TP 후 같은 방향 즉시 재진입 방지)
+if color_changed
+    saw_color_change := true
 
 // 스코어 계산
 exit_long_score  = (found_pivot_high ? 1 : 0) + (rsi_overbought ? 1 : 0) + (hma_slope_down ? 1 : 0)
 exit_short_score = (found_pivot_low  ? 1 : 0) + (rsi_oversold   ? 1 : 0) + (hma_slope_up   ? 1 : 0)
 
-// ── CL (청산): 포지션 보유 중 색상 반전 → 반대 진입 없이 플랫으로 ──
+// ── CL (청산): 포지션 보유 중 색상 반전 → 플랫 ──
 close_long  = position ==  1 and color_changed and trend_state !=  1 and barstate.isconfirmed
 close_short = position == -1 and color_changed and trend_state != -1 and barstate.isconfirmed
 
-// ── TP: 포지션 보유 중 스코어 충족 (CL과 동시 시 CL 우선) ──
+// ── TP: 포지션 보유 중 스코어 충족 (CL 동시 시 CL 우선) ──
 tp_from_long  = exit_long_score  >= exit_min_score and position ==  1 and not_squeeze and not close_long  and barstate.isconfirmed
 tp_from_short = exit_short_score >= exit_min_score and position == -1 and not_squeeze and not close_short and barstate.isconfirmed
 
-// ── Entry: 플랫 + 쿨다운 경과 + 대기 중 + 추세 방향 확정 ──
-entry_long  = awaiting_entry and passed_cooldown and trend_state ==  1 and position == 0 and barstate.isconfirmed
-entry_short = awaiting_entry and passed_cooldown and trend_state == -1 and position == 0 and barstate.isconfirmed
+// ── Entry: 플랫 + ADX 강세 + 추세 방향 확정 + 색상 변화 이력 ──
+entry_long  = awaiting_entry and position == 0 and trend_state ==  1 and strong_trend and saw_color_change and barstate.isconfirmed
+entry_short = awaiting_entry and position == 0 and trend_state == -1 and strong_trend and saw_color_change and barstate.isconfirmed
 
-// ── 포지션 상태 갱신 ──
+// ── 상태 갱신 ──
 if close_long or close_short
     position := 0
-    exit_bar := bar_index
     awaiting_entry := true
+    saw_color_change := true   // CL 자체가 색상 변화 → 즉시 재진입 가능 (ADX 확인 후)
 if tp_from_long or tp_from_short
     position := 0
-    exit_bar := bar_index
     awaiting_entry := true
+    saw_color_change := false  // TP 후에는 새 색상 변화 필요 (같은 방향 재진입 방지)
 if entry_long
     position := 1
     awaiting_entry := false
+    saw_color_change := false
 if entry_short
     position := -1
     awaiting_entry := false
+    saw_color_change := false
 
 // ─── 시그널 표시 ─────────────────────────────────────────────────────────
 plotshape(entry_long, title="Entry Long", text="LONG", style=shape.labelup,
@@ -202,7 +212,7 @@ if close_long or close_short
 
 alertcondition(entry_long,    title="Entry Long",   message="KBGv3: ENTRY → LONG")
 alertcondition(entry_short,   title="Entry Short",  message="KBGv3: ENTRY → SHORT")
-alertcondition(close_long,    title="CL (롱 청산)", message="KBGv3: CL → 롱 청산 (색상 반전)")
-alertcondition(close_short,   title="CL (숏 청산)", message="KBGv3: CL → 숏 청산 (색상 반전)")
-alertcondition(tp_from_long,  title="TP (롱 청산)", message="KBGv3: TP → 롱 청산 (고점 반전)")
-alertcondition(tp_from_short, title="TP (숏 청산)", message="KBGv3: TP → 숏 청산 (저점 반전)")
+alertcondition(close_long,    title="CL (롱 청산)", message="KBGv3: CL → 롱 청산")
+alertcondition(close_short,   title="CL (숏 청산)", message="KBGv3: CL → 숏 청산")
+alertcondition(tp_from_long,  title="TP (롱 청산)", message="KBGv3: TP → 롱 청산")
+alertcondition(tp_from_short, title="TP (숏 청산)", message="KBGv3: TP → 숏 청산")
