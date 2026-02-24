@@ -111,28 +111,25 @@ hma_val = hullma(hma_src, hma_base_length + hma_length_scalar * 6)
 hma_slope_down = hma_val[1] < hma_val[2]
 hma_slope_up   = hma_val[1] > hma_val[2]
 
-// 포지션 추적
-var int position = 0  // 1=롱, -1=숏, 0=없음
-if trend_to_long
-    position := 1
-if trend_to_short
-    position := -1
-if trend_to_neutral
-    position := 0
+// 포지션 추적 (TP 반전 기반 — 트렌드 색상으로 리셋하지 않음)
+var int position = 0     // 1=롱, -1=숏, 0=없음
+var int last_signal = 0  // 마지막 시그널 방향: 1=롱, -1=숏
 
 // 스코어 계산
 exit_long_score  = (found_pivot_high ? 1 : 0) + (rsi_overbought ? 1 : 0) + (hma_slope_down ? 1 : 0)
 exit_short_score = (found_pivot_low  ? 1 : 0) + (rsi_oversold   ? 1 : 0) + (hma_slope_up   ? 1 : 0)
 
-// TP 반전 시그널: 롱 보유 중 고점 감지 → 숏 전환 / 숏 보유 중 저점 감지 → 롱 전환
-rev_to_short = position ==  1 and exit_long_score  >= exit_min_score and barstate.isconfirmed
-rev_to_long  = position == -1 and exit_short_score >= exit_min_score and barstate.isconfirmed
+// TP 반전 시그널: 스코어 충족 + 직전 시그널과 다른 방향만 허용
+rev_to_short = exit_long_score  >= exit_min_score and last_signal != -1 and barstate.isconfirmed
+rev_to_long  = exit_short_score >= exit_min_score and last_signal !=  1 and barstate.isconfirmed
 
-// 포지션 반전
+// 포지션 & 시그널 기록 갱신
 if rev_to_short
-    position := -1
+    position    := -1
+    last_signal := -1
 if rev_to_long
-    position := 1
+    position    :=  1
+    last_signal :=  1
 
 // 시그널 표시
 plotshape(rev_to_short, title="TP → Short", text="SHORT", style=shape.labeldown,
