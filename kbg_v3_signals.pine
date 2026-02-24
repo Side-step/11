@@ -130,37 +130,57 @@ hma_slope_up   = hma_val[1] > hma_val[2]
 
 // ─── 포지션 상태 머신 ──────────────────────────────────────────────────────
 // position: 0=플랫, 1=롱, -1=숏
-// 규칙: LONG → TP → SHORT → TP → LONG ... 또는 LONG ↔ SHORT 직접 전환
-//       동일 방향 진입 반복 불가, 포지션 없이 TP 불가
+// 핵심: 직접 LONG↔SHORT 전환 금지!
+//   진입 → TP 또는 CL(청산) → 쿨다운 대기 → 재진입
+//   횡보 구간 색상 왕복 = CL 후 쿨다운으로 재진입 차단 → 휩소 방지
 var int position = 0
+var int exit_bar = -999          // 마지막 청산 bar_index
+var bool awaiting_entry = true   // 재진입 대기 플래그
+
+cooldown_bars = input.int(5, minval=0, maxval=20, title="CL → 재진입 쿨다운 (봉 수)", group="Entry Filter")
+passed_cooldown = bar_index - exit_bar >= cooldown_bars
 
 // 스코어 계산
 exit_long_score  = (found_pivot_high ? 1 : 0) + (rsi_overbought ? 1 : 0) + (hma_slope_down ? 1 : 0)
 exit_short_score = (found_pivot_low  ? 1 : 0) + (rsi_oversold   ? 1 : 0) + (hma_slope_up   ? 1 : 0)
 
-// 진입 시그널: 이미 같은 포지션이면 무시
-entry_long  = color_changed and trend_state ==  1 and position !=  1 and barstate.isconfirmed
-entry_short = color_changed and trend_state == -1 and position != -1 and barstate.isconfirmed
+// ── CL (청산): 포지션 보유 중 색상 반전 → 반대 진입 없이 플랫으로 ──
+close_long  = position ==  1 and color_changed and trend_state !=  1 and barstate.isconfirmed
+close_short = position == -1 and color_changed and trend_state != -1 and barstate.isconfirmed
 
-// TP 시그널: 해당 포지션 보유 중일 때만 + 진입과 동시 발생 시 진입 우선
-tp_from_long  = exit_long_score  >= exit_min_score and position ==  1 and not_squeeze and not entry_short and barstate.isconfirmed
-tp_from_short = exit_short_score >= exit_min_score and position == -1 and not_squeeze and not entry_long  and barstate.isconfirmed
+// ── TP: 포지션 보유 중 스코어 충족 (CL과 동시 시 CL 우선) ──
+tp_from_long  = exit_long_score  >= exit_min_score and position ==  1 and not_squeeze and not close_long  and barstate.isconfirmed
+tp_from_short = exit_short_score >= exit_min_score and position == -1 and not_squeeze and not close_short and barstate.isconfirmed
 
-// 포지션 갱신 (진입 우선, TP 후순위)
+// ── Entry: 플랫 + 쿨다운 경과 + 대기 중 + 추세 방향 확정 ──
+entry_long  = awaiting_entry and passed_cooldown and trend_state ==  1 and position == 0 and barstate.isconfirmed
+entry_short = awaiting_entry and passed_cooldown and trend_state == -1 and position == 0 and barstate.isconfirmed
+
+// ── 포지션 상태 갱신 ──
+if close_long or close_short
+    position := 0
+    exit_bar := bar_index
+    awaiting_entry := true
+if tp_from_long or tp_from_short
+    position := 0
+    exit_bar := bar_index
+    awaiting_entry := true
 if entry_long
-    position :=  1
+    position := 1
+    awaiting_entry := false
 if entry_short
     position := -1
-if tp_from_long
-    position :=  0
-if tp_from_short
-    position :=  0
+    awaiting_entry := false
 
-// ─── 시그널 표시 (진입 + TP 모두 여기서) ──────────────────────────────────
-plotshape(entry_long, title="Color → Long", text="LONG", style=shape.labelup,
+// ─── 시그널 표시 ─────────────────────────────────────────────────────────
+plotshape(entry_long, title="Entry Long", text="LONG", style=shape.labelup,
      location=location.belowbar, color=color.lime, textcolor=color.white, size=size.small)
-plotshape(entry_short, title="Color → Short", text="SHORT", style=shape.labeldown,
+plotshape(entry_short, title="Entry Short", text="SHORT", style=shape.labeldown,
      location=location.abovebar, color=color.maroon, textcolor=color.white, size=size.small)
+plotshape(close_long, title="CL (롱 청산)", text="CL", style=shape.labeldown,
+     location=location.abovebar, color=color.orange, textcolor=color.white, size=size.small)
+plotshape(close_short, title="CL (숏 청산)", text="CL", style=shape.labelup,
+     location=location.belowbar, color=color.orange, textcolor=color.white, size=size.small)
 plotshape(tp_from_long, title="TP (롱 청산)", text="TP", style=shape.labeldown,
      location=location.abovebar, color=color.red, textcolor=color.white, size=size.normal)
 plotshape(tp_from_short, title="TP (숏 청산)", text="TP", style=shape.labelup,
@@ -174,11 +194,15 @@ plot(found_pivot_low ? pl : na, title="Pivot Low", style=plot.style_cross,
 
 // ─── 알림 ──────────────────────────────────────────────────────────────────
 if entry_long
-    alert("COLOR → LONG", alert.freq_once_per_bar_close)
+    alert("ENTRY → LONG", alert.freq_once_per_bar_close)
 if entry_short
-    alert("COLOR → SHORT", alert.freq_once_per_bar_close)
+    alert("ENTRY → SHORT", alert.freq_once_per_bar_close)
+if close_long or close_short
+    alert("CL → 청산", alert.freq_once_per_bar_close)
 
-alertcondition(entry_long,    title="Color → Long",  message="KBGv3: COLOR → LONG (녹색 전환)")
-alertcondition(entry_short,   title="Color → Short", message="KBGv3: COLOR → SHORT (적색 전환)")
-alertcondition(tp_from_long,  title="TP (롱 청산)",  message="KBGv3: TP → 롱 청산 (고점 반전)")
-alertcondition(tp_from_short, title="TP (숏 청산)",  message="KBGv3: TP → 숏 청산 (저점 반전)")
+alertcondition(entry_long,    title="Entry Long",   message="KBGv3: ENTRY → LONG")
+alertcondition(entry_short,   title="Entry Short",  message="KBGv3: ENTRY → SHORT")
+alertcondition(close_long,    title="CL (롱 청산)", message="KBGv3: CL → 롱 청산 (색상 반전)")
+alertcondition(close_short,   title="CL (숏 청산)", message="KBGv3: CL → 숏 청산 (색상 반전)")
+alertcondition(tp_from_long,  title="TP (롱 청산)", message="KBGv3: TP → 롱 청산 (고점 반전)")
+alertcondition(tp_from_short, title="TP (숏 청산)", message="KBGv3: TP → 숏 청산 (저점 반전)")
