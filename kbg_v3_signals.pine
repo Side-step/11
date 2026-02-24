@@ -1,0 +1,102 @@
+//@version=5
+indicator(title='all new KBGv3', shorttitle='all new KBGv3', overlay=true)
+
+// Inputs
+showZigZags = input.bool(false)
+useAltTF1 = input.bool(false, title='Use Alt Timeframe')
+tf1 = input.timeframe('60', title='Alt Timeframe')
+tf2 = input.timeframe('240', title='Alt Timeframe')
+tf3 = input.timeframe('480', title='Alt Timeframe')
+
+// ─── 리페인트 수정 핵심 ───────────────────────────────────────────────────────
+// 기존: 함수 안에서 request.security 반환 (중첩 호출) + lookahead_on → 리페인트
+// 수정: 함수는 순수 계산만 담당, 단일 security 호출에서 [1] + lookahead_off 사용
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Zigzag function (non-repainting: 순수 계산만, security 호출 없음)
+zigzag() =>
+    var float _direction = na
+    _isUp   = close >= open
+    _isDown = close <= open
+    _direction := _isUp[1] and _isDown ? -1 : _isDown[1] and _isUp ? 1 : nz(_direction[1])
+    _isUp[1] and _isDown and _direction[1] != -1 ? high :
+     _isDown[1] and _isUp and _direction[1] != 1  ? low  : na
+
+// 확정 봉 기준: expression[1] + lookahead_off → 완전 논리페인트
+zz3 = request.security(syminfo.tickerid, tf3, zigzag()[1], lookahead=barmerge.lookahead_off)
+
+// Plot ZigZag
+plot(not showZigZags ? na : zz3, title='zigzag3', color=color.red, linewidth=3)
+
+// Identify ZigZag levels
+var float lastZigzag = na
+is_lvl3_high = (not na(zz3) and zz3 >= high and zz3 != lastZigzag)
+is_lvl3_low  = (not na(zz3) and zz3 <= low  and zz3 != lastZigzag)
+if (not na(zz3) and zz3 != lastZigzag)
+    lastZigzag := zz3
+
+plotshape(is_lvl3_high, color=color.red,  text="S", location=location.abovebar)
+plotshape(is_lvl3_low,  color=color.blue, text="L", location=location.belowbar)
+
+// Alerts
+if (is_lvl3_high)
+    alert("S", alert.freq_once_per_bar_close)
+if (is_lvl3_low)
+    alert("L", alert.freq_once_per_bar_close)
+
+// KBG MA Settings
+show_hma        = input.bool(true,  title="Display KBG MA Set:")
+hma_src         = input.source(close, title="KBG MA's Source:")
+hma_base_length = input.int(8, minval=1, title="KBG MA's Base Length:")
+hma_length_scalar = input.int(5, minval=0, title="KBG MA's Length Scalar:")
+
+// Hull Moving Average function
+hullma(src, length) =>
+    ta.wma(2 * ta.wma(src, length / 2) - ta.wma(src, length), math.round(math.sqrt(length)))
+
+// Plot Hull MA
+plot(not show_hma ? na : hullma(hma_src, hma_base_length + hma_length_scalar * 6),
+     color=color.lime, linewidth=3, title="KBG MA")
+
+// KBG MA Trend
+len1 = input.int(5)
+len3 = input.int(240)
+src  = close
+ma1  = ta.wma(2 * ta.wma(src, len1 / 2) - ta.wma(src, len1), math.round(math.sqrt(len1)))
+ma   = ta.wma(2 * ta.wma(src, len3 / 2) - ta.wma(src, len3), math.round(math.sqrt(len3)))
+atr_range = ta.tr(true)
+rangema   = ta.wma(2 * ta.wma(atr_range, len3 / 2) - ta.wma(atr_range, len3), math.round(math.sqrt(len3)))
+upper2 = ma + rangema * 0.5
+lower2 = ma - rangema * 0.5
+
+// Trend Definition
+tr_up   = ma1 > upper2
+tr_down = ma1 < lower2
+scolor  = tr_up ? color.green : tr_down ? color.red : color.blue
+bgcolor(scolor)
+
+// ─── 색상 변화 시그널 (Color Change Signals) ─────────────────────────────────
+// 트렌드 상태를 숫자로 변환: 1=Green(Long), -1=Red(Short), 0=Blue(Close)
+trend_state = tr_up ? 1 : tr_down ? -1 : 0
+prev_state  = tr_up[1] ? 1 : tr_down[1] ? -1 : 0
+
+// 색상이 변할 때만 시그널 발생
+color_changed = trend_state != prev_state
+
+// 시그널 조건
+signal_long  = color_changed and trend_state ==  1  // 초록색으로 변경 → 롱
+signal_short = color_changed and trend_state == -1  // 빨간색으로 변경 → 숏
+signal_close = color_changed and trend_state ==  0  // 파란색으로 변경 → 클로즈
+
+// 시그널 표시
+plotshape(signal_long,  title="Long Signal",  text="LONG",  style=shape.labelup,
+     location=location.belowbar, color=color.green, textcolor=color.white, size=size.normal)
+plotshape(signal_short, title="Short Signal", text="SHORT", style=shape.labeldown,
+     location=location.abovebar, color=color.red,   textcolor=color.white, size=size.normal)
+plotshape(signal_close, title="Close Signal", text="CLOSE", style=shape.diamond,
+     location=location.abovebar, color=color.blue,  textcolor=color.white, size=size.normal)
+
+// 시그널 알림 (Alerts)
+alertcondition(signal_long,  title="Long Signal",  message="KBGv3: LONG - 초록색 전환")
+alertcondition(signal_short, title="Short Signal", message="KBGv3: SHORT - 빨간색 전환")
+alertcondition(signal_close, title="Close Signal", message="KBGv3: CLOSE - 파란색 전환")
