@@ -83,17 +83,7 @@ trend_to_long  = color_changed and trend_state ==  1 and barstate.isconfirmed
 trend_to_short = color_changed and trend_state == -1 and barstate.isconfirmed
 trend_to_neutral = color_changed and trend_state == 0 and barstate.isconfirmed
 
-// 색상 변화 진입 시그널 표시
-plotshape(trend_to_long, title="Color → Long", text="LONG", style=shape.labelup,
-     location=location.belowbar, color=color.lime, textcolor=color.white, size=size.small)
-plotshape(trend_to_short, title="Color → Short", text="SHORT", style=shape.labeldown,
-     location=location.abovebar, color=color.maroon, textcolor=color.white, size=size.small)
-
-// 색상 변화 알림
-if trend_to_long
-    alert("COLOR → LONG", alert.freq_once_per_bar_close)
-if trend_to_short
-    alert("COLOR → SHORT", alert.freq_once_per_bar_close)
+// (진입 시그널 표시는 포지션 상태 머신 뒤에서 처리)
 
 // ─── TP 반전 시그널 (Swing Reverse Signals) ─────────────────────────────────
 // 고점 감지 → 롱 청산 + 숏 진입 / 저점 감지 → 숏 청산 + 롱 진입
@@ -138,36 +128,42 @@ hma_val = hullma(hma_src, hma_base_length + hma_length_scalar * 6)
 hma_slope_down = hma_val[1] < hma_val[2]
 hma_slope_up   = hma_val[1] > hma_val[2]
 
-// 포지션 추적 (색상 변화 진입 + TP 반전)
-var int position = 0     // 1=롱, -1=숏, 0=없음
-var int last_signal = 0  // 마지막 시그널 방향: 1=롱, -1=숏
+// ─── 포지션 상태 머신 ──────────────────────────────────────────────────────
+// position: 0=플랫, 1=롱, -1=숏
+// 규칙: LONG → TP → SHORT → TP → LONG ... 또는 LONG ↔ SHORT 직접 전환
+//       동일 방향 진입 반복 불가, 포지션 없이 TP 불가
+var int position = 0
 
 // 스코어 계산
 exit_long_score  = (found_pivot_high ? 1 : 0) + (rsi_overbought ? 1 : 0) + (hma_slope_down ? 1 : 0)
 exit_short_score = (found_pivot_low  ? 1 : 0) + (rsi_oversold   ? 1 : 0) + (hma_slope_up   ? 1 : 0)
 
-// TP 반전 시그널: 스코어 충족 + 교대 + BB 스퀴즈 아닐 때만
-rev_to_short = exit_long_score  >= exit_min_score and last_signal != -1 and not_squeeze and barstate.isconfirmed
-rev_to_long  = exit_short_score >= exit_min_score and last_signal !=  1 and not_squeeze and barstate.isconfirmed
+// 진입 시그널: 이미 같은 포지션이면 무시
+entry_long  = color_changed and trend_state ==  1 and position !=  1 and barstate.isconfirmed
+entry_short = color_changed and trend_state == -1 and position != -1 and barstate.isconfirmed
 
-// 포지션 & 시그널 기록 갱신 (색상변화 진입 → TP 반전 순서)
-if trend_to_long
-    position    :=  1
-    last_signal :=  1
-if trend_to_short
-    position    := -1
-    last_signal := -1
-if rev_to_short
-    position    := -1
-    last_signal := -1
-if rev_to_long
-    position    :=  1
-    last_signal :=  1
+// TP 시그널: 해당 포지션 보유 중일 때만 + 진입과 동시 발생 시 진입 우선
+tp_from_long  = exit_long_score  >= exit_min_score and position ==  1 and not_squeeze and not entry_short and barstate.isconfirmed
+tp_from_short = exit_short_score >= exit_min_score and position == -1 and not_squeeze and not entry_long  and barstate.isconfirmed
 
-// 시그널 표시
-plotshape(rev_to_short, title="TP → Short", text="TP", style=shape.labeldown,
+// 포지션 갱신 (진입 우선, TP 후순위)
+if entry_long
+    position :=  1
+if entry_short
+    position := -1
+if tp_from_long
+    position :=  0
+if tp_from_short
+    position :=  0
+
+// ─── 시그널 표시 (진입 + TP 모두 여기서) ──────────────────────────────────
+plotshape(entry_long, title="Color → Long", text="LONG", style=shape.labelup,
+     location=location.belowbar, color=color.lime, textcolor=color.white, size=size.small)
+plotshape(entry_short, title="Color → Short", text="SHORT", style=shape.labeldown,
+     location=location.abovebar, color=color.maroon, textcolor=color.white, size=size.small)
+plotshape(tp_from_long, title="TP (롱 청산)", text="TP", style=shape.labeldown,
      location=location.abovebar, color=color.red, textcolor=color.white, size=size.normal)
-plotshape(rev_to_long, title="TP → Long", text="TP", style=shape.labelup,
+plotshape(tp_from_short, title="TP (숏 청산)", text="TP", style=shape.labelup,
      location=location.belowbar, color=color.green, textcolor=color.white, size=size.normal)
 
 // Pivot 레벨 표시 (참고용)
@@ -176,10 +172,13 @@ plot(found_pivot_high ? ph : na, title="Pivot High", style=plot.style_cross,
 plot(found_pivot_low ? pl : na, title="Pivot Low", style=plot.style_cross,
      color=color.new(color.green, 30), linewidth=2, offset=-exit_pivot_right)
 
-// 알림 — 색상 변화 진입
-alertcondition(trend_to_long,  title="Color → Long",  message="KBGv3: COLOR → LONG (녹색 전환)")
-alertcondition(trend_to_short, title="Color → Short", message="KBGv3: COLOR → SHORT (적색 전환)")
+// ─── 알림 ──────────────────────────────────────────────────────────────────
+if entry_long
+    alert("COLOR → LONG", alert.freq_once_per_bar_close)
+if entry_short
+    alert("COLOR → SHORT", alert.freq_once_per_bar_close)
 
-// 알림 — TP 반전
-alertcondition(rev_to_short, title="TP → Short", message="KBGv3: TP REVERSE → SHORT (고점 반전)")
-alertcondition(rev_to_long,  title="TP → Long",  message="KBGv3: TP REVERSE → LONG (저점 반전)")
+alertcondition(entry_long,    title="Color → Long",  message="KBGv3: COLOR → LONG (녹색 전환)")
+alertcondition(entry_short,   title="Color → Short", message="KBGv3: COLOR → SHORT (적색 전환)")
+alertcondition(tp_from_long,  title="TP (롱 청산)",  message="KBGv3: TP → 롱 청산 (고점 반전)")
+alertcondition(tp_from_short, title="TP (숏 청산)",  message="KBGv3: TP → 숏 청산 (저점 반전)")
